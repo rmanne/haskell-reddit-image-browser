@@ -1,0 +1,101 @@
+name:                hs-reddit-image-browser
+version:             0.1.0.0
+github:              "rmanne/hs-reddit-image-browser"
+license:             BSD3
+author:              "Rahul Manne"
+maintainer:          "rahul_manne@hotmail.com"
+copyright:           "2018 Rahul Manne"
+
+extra-source-files:
+- README.md
+- ChangeLog.md
+
+# Metadata used when publishing your package
+# synopsis:            Short description of your package
+# category:            Web
+
+# To avoid duplicated efforts in documentation and dealing with the
+# complications of embedding Haddock markup inside cabal files, it is
+# common to point users to the README.md file.
+description:         Please see the README on GitHub at <https://github.com/rmanne/hs-reddit-image-browser#readme>
+
+dependencies:
+- base >= 4.7 && < 5
+- bytestring
+- containers
+- mtl
+- directory
+- gi-gst
+- gi-gdk
+- gi-gobject
+- haskell-gi-base
+- text
+- gi-gtk
+- gi-gdkx11
+- gi-glib
+- gi-gstvideo
+- reddit
+- api-builder
+- cereal
+- regex-pcre
+- http-conduit
+- filepath
+- process
+- wreq
+- http-client
+- aeson
+- lens
+- time
+- aria2c-rpc
+- ffmpeg-light
+- sdl2
+- monad-loops
+- transformers
+- vector
+- unordered-containers
+- yaml
+
+default-extensions:
+- LambdaCase
+- OverloadedStrings
+- TupleSections
+- MultiWayIf
+- NamedFieldPuns
+- RecordWildCards
+
+library:
+  source-dirs: src
+
+executables:
+  #rib:
+  #  main:                Main.hs
+  #  source-dirs:         app
+  #  ghc-options:
+  #  - -threaded
+  #  - -rtsopts
+  #  - -with-rtsopts=-N
+  #  - -O2
+  #  dependencies:
+  #  - hs-reddit-image-browser
+  rib2:
+    main:                Main2.hs
+    source-dirs:         app
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    - -O2
+    - -main-is Main2
+    dependencies:
+    - hs-reddit-image-browser
+  #demo-vplay:
+  #  main:                VPlay.hs
+  #  source-dirs:         app
+  #  ghc-options:
+  #  - -threaded
+  #  - -rtsopts
+  #  - -with-rtsopts=-N
+  #  - -O2
+  #  - -main-is VPlay
+  #  dependencies:
+  #  - hs-reddit-image-browser
