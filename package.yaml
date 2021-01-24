@@ -25,15 +25,7 @@ dependencies:
 - containers
 - mtl
 - directory
-- gi-gst
-- gi-gdk
-- gi-gobject
-- haskell-gi-base
 - text
-- gi-gtk
-- gi-gdkx11
-- gi-glib
-- gi-gstvideo
 - reddit
 - api-builder
 - cereal
@@ -67,35 +59,14 @@ library:
   source-dirs: src
 
 executables:
-  #rib:
-  #  main:                Main.hs
-  #  source-dirs:         app
-  #  ghc-options:
-  #  - -threaded
-  #  - -rtsopts
-  #  - -with-rtsopts=-N
-  #  - -O2
-  #  dependencies:
-  #  - hs-reddit-image-browser
-  rib2:
-    main:                Main2.hs
+  rib:
+    main:                Main.hs
     source-dirs:         app
     ghc-options:
     - -threaded
     - -rtsopts
     - -with-rtsopts=-N
     - -O2
-    - -main-is Main2
+    - -main-is Main
     dependencies:
     - hs-reddit-image-browser
-  #demo-vplay:
-  #  main:                VPlay.hs
-  #  source-dirs:         app
-  #  ghc-options:
-  #  - -threaded
-  #  - -rtsopts
-  #  - -with-rtsopts=-N
-  #  - -O2
-  #  - -main-is VPlay
-  #  dependencies:
-  #  - hs-reddit-image-browser

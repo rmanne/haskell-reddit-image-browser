@@ -40,11 +40,6 @@ packages:
 # using the same syntax as the packages field.
 # (e.g., acme-missiles-0.3)
 extra-deps:
-- gi-gst-1.0.22
-- gi-gdkx11-3.0.9
-- gi-xlib-2.0.8
-- gi-gstvideo-1.0.22
-- gi-gstbase-1.0.22
 - ffmpeg-light-0.13.0
 - reddit
 - api-builder
