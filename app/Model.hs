@@ -1,4 +1,5 @@
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE TemplateHaskell #-}
 
 module Model
   ( model
@@ -14,12 +15,41 @@ import Control.Concurrent.Chan
   , writeList2Chan
   )
 import Control.Exception (SomeException(SomeException), catch)
-import Control.Monad (foldM, foldM_, forM_, forever, mapM_)
+import qualified Control.Lens as Lens
+import Control.Lens
+  ( (%=)
+  , (%~)
+  , (&)
+  , (+=)
+  , (-=)
+  , (.=)
+  , (.~)
+  , (^.)
+  , _2
+  , makeLenses
+  , use
+  )
+import Control.Monad
+  ( foldM
+  , foldM_
+  , forM_
+  , forever
+  , join
+  , mapM_
+  , replicateM_
+  , when
+  )
+import Control.Monad.Loops (untilM_)
+import Control.Monad.Trans.Class (lift)
+import qualified Control.Monad.Trans.State.Strict as State
 import Data.Aeson (FromJSON, decode)
 import Data.IORef (IORef, writeIORef)
 import qualified Data.Map as Map
 import Data.Map (Map)
 import Data.Maybe (fromMaybe)
+import Data.Maybe (catMaybes, isJust)
+import Data.PointedList
+import qualified Data.PointedList
 import qualified Data.Text as Text
 import Data.Text (Text)
 import qualified Data.Text.Encoding as Text
@@ -30,6 +60,7 @@ import ImageLink
 import Lib
 import qualified Network.API.Builder.Routes as Routes
 import qualified Network.Aria2 as Aria2
+import qualified OldPointedList
 import qualified Reddit as R
 import qualified Reddit.Types.Listing as R
 import qualified Reddit.Types.OAuth as R
@@ -48,34 +79,33 @@ import System.FilePath.Posix (takeExtension)
 import Text.Read (readEither)
 import Types
 
+--import Control.Monad.Extra(whenM)
+whenM :: Monad m => m Bool -> m () -> m ()
+whenM condition action =
+  condition >>= \case
+    True -> action
+    False -> return ()
+
 postId :: Post -> R.PostID
 postId (Downloaded R.Post {R.postID = p} _) = p
 postId (Submitted R.Post {R.postID = p}) = p
 postId (Failed p) = p
 postId (Deleted p) = p
 
-data PointedList a =
-  PointedList
-    { front :: [a]
-    , current :: a
-    , back :: [a]
-    }
-  deriving (Show, Read)
-
 data SpecialArg =
   SpecialArg
-    { route :: [String]
-    , refreshToken :: String
+    { route :: [Text]
+    , refreshToken :: Text
     }
   deriving (Generic)
 
 data Config =
   Config
-    { userAgent :: String
-    , clientId :: String
-    , secret :: String
-    , path :: String
-    , specialArgs :: Map String SpecialArg
+    { userAgent :: Text
+    , clientId :: Text
+    , secret :: Text
+    , path :: Text
+    , specialArgs :: Map Text SpecialArg
     , aria2Secret :: Maybe Text
     }
   deriving (Generic)
@@ -86,45 +116,80 @@ instance FromJSON Config
 
 data Model =
   Model
-    { skipDeleted :: Bool
-    , posts :: PointedList Post
-    , subredditName :: R.SubredditName
-    , downloaded :: Map R.PostID [FilePath]
-    , downloadedMulti :: Map (R.PostID, Int) FilePath
-    , downloadChannel :: Chan R.Post
-    , slideshowThread :: Maybe ThreadId
-    , multi :: Int
-    , currentIndex :: Int
-    , config :: Config
+    { _skipDeleted :: Bool
+    , _posts :: PointedList Post
+    , _subredditName :: R.SubredditName
+    , _downloaded :: Map R.PostID [FilePath]
+    , _downloadedMulti :: Map (R.PostID, Int) FilePath
+    , _downloadChannel :: Chan R.Post
+    , _slideshowThread :: Maybe ThreadId
+    , _multi :: Int
+    , _currentIndex :: Int
+    , _config :: Config
     }
 
-save :: Model -> IO ()
-save state@Model {subredditName = R.R subreddit, config} = do
-  startTime <- getCPUTime
-  writeFile
-    (path config ++ Text.unpack subreddit ++ ".conf")
-    (show $ posts state)
-  endTime <- getCPUTime
-  putStrLn $
+$(makeLenses ''Model)
+
+save :: ModelM ()
+save = do
+  startTime <- lift getCPUTime
+  posts <- use posts
+  R.R subreddit <- use subredditName
+  config <- use config
+  lift $
+    writeFile
+      (Text.unpack (path config) <> Text.unpack subreddit <> ".conf")
+      (show posts)
+  endTime <- lift getCPUTime
+  lift $
+    putStrLn $
     "Saved reddit in " ++ show ((endTime - startTime) `div` 1000000000) ++ "ms"
 
 load :: Config -> String -> Chan R.Post -> IO (PointedList Post)
 load config subr dlchannel =
-  readEither <$>
-  (readFile (path config ++ subr ++ ".conf") `catch` \(SomeException _) ->
-     return "") >>= \case
-    Left _ -> do
-      initialPosts <- redditGet config (R.R $ Text.pack subr) Nothing dlchannel
-      return
-        PointedList
-          {front = [], current = head initialPosts, back = tail initialPosts}
-    Right r@PointedList {front = f, current = c, back = b} ->
-      mapM_
-        (\case
-           Submitted p -> writeChan dlchannel p
-           _ -> return ())
-        (f ++ c : b) >>
-      return r
+  doesFileExist fileName >>= \case
+    False ->
+      Data.PointedList.fromList <$>
+      redditGet config (R.R $ Text.pack subr) Nothing dlchannel
+    True ->
+      readEither <$> (readFile fileName `catch` \(SomeException _) -> return "") >>= \case
+        Left message1 -> do
+          putStrLn "Loading Failed, trying old loading..."
+          readEither <$>
+            (readFile fileName `catch` \(SomeException _) -> return "") >>= \case
+            Left message2 ->
+              putStrLn
+                ("Loading Failed, file: " <>
+                 (Text.unpack (path config) <> subr <> ".conf")) >>
+              putStrLn message1 >>
+              putStrLn message2 >>
+              fail "Loading failed"
+            Right oldList ->
+              let list = OldPointedList.conv oldList
+               in mapM_
+                    (\case
+                       Submitted p -> writeChan dlchannel p
+                       _ -> return ())
+                    list >>
+                  return list
+        Right list ->
+          mapM_
+            (\case
+               Submitted p -> writeChan dlchannel p
+               _ -> return ())
+            list >>
+          return list
+  where
+    fileName = Text.unpack (path config) <> subr <> ".conf"
+
+redditGetT :: Maybe (R.PaginationOption R.PostID) -> ModelM [Post]
+redditGetT options =
+  join $
+  (\config subredditName downloadChannel ->
+     lift $ redditGet config subredditName options downloadChannel) <$>
+  use config <*>
+  use subredditName <*>
+  use downloadChannel
 
 redditGet ::
      Config
@@ -159,174 +224,153 @@ redditGet config subreddit@(R.R arg) option dlchannel =
       putStrLn $ "Unable to get newer: " ++ show msg
       return []
   where
-    opts = R.Options {R.pagination = option, R.limit = Just 100}
     (redditOptions, redditAction) =
-      case Map.lookup (Text.unpack arg) (specialArgs config) of
-        Nothing ->
-          ( R.defaultRedditOptions
-              { R.customUserAgent =
-                  Just (Text.encodeUtf8 $ Text.pack $ userAgent config)
-              }
-          , R.getPosts'
-              R.Options {R.pagination = option, R.limit = Just 100}
-              R.New
-              (Just subreddit))
-        Just SpecialArg {refreshToken, route} ->
-          ( R.defaultRedditOptions
-              { R.customUserAgent =
-                  Just (Text.encodeUtf8 $ Text.pack $ userAgent config)
-              , R.loginMethod =
-                  R.OAuth
-                    R.Script
-                      { R.clientId = Text.pack $ clientId config
-                      , R.secret = Text.pack $ secret config
-                      , R.redirectUrl = ""
-                      }
-                    (R.RefreshToken $ Text.pack refreshToken)
-              }
-          , R.runRoute
-              (Routes.Route
-                 (map Text.pack route)
-                 [ "limit" Routes.=. Options.limit opts
-                 , "before" Routes.=. Options.before opts
-                 , "after" Routes.=. Options.after opts
-                 ]
-                 "GET"))
+      redditOptionsFor config arg & _2 %~ ($ option)
 
-next' :: PointedList a -> PointedList a
-next' PointedList {front = f, current = c, back = h:t} =
-  PointedList {front = c : f, current = h, back = t}
+redditOptionsFor ::
+     Config
+  -> Text
+  -> ( R.RedditOptions
+     , Maybe (R.PaginationOption R.PostID) -> R.RedditT IO R.PostListing)
+redditOptionsFor config subreddit =
+  case Map.lookup subreddit (specialArgs config) of
+    Nothing ->
+      ( R.defaultRedditOptions
+          {R.customUserAgent = Just (Text.encodeUtf8 $ userAgent config)}
+      , \option ->
+          R.getPosts'
+            R.Options {R.pagination = option, R.limit = Just 100}
+            R.New
+            (Just $ R.R subreddit))
+    Just SpecialArg {refreshToken, route} ->
+      ( R.defaultRedditOptions
+          { R.customUserAgent = Just (Text.encodeUtf8 $ userAgent config)
+          , R.loginMethod =
+              R.OAuth
+                R.Script
+                  { R.clientId = clientId config
+                  , R.secret = secret config
+                  , R.redirectUrl = ""
+                  }
+                (R.RefreshToken refreshToken)
+          }
+      , \option ->
+          let opts = R.Options {R.pagination = option, R.limit = Just 100}
+           in R.runRoute
+                (Routes.Route
+                   route
+                   [ "limit" Routes.=. Options.limit opts
+                   , "before" Routes.=. Options.before opts
+                   , "after" Routes.=. Options.after opts
+                   ]
+                   "GET"))
 
-prev' :: PointedList a -> PointedList a
-prev' PointedList {front = h:t, current = c, back = b} =
-  PointedList {front = t, current = h, back = c : b}
-
-front' :: PointedList a -> PointedList a
-front' list@PointedList {front = []} = list
-front' PointedList {front = f, current = c, back = b} =
-  let h:t = reverse f
-   in PointedList {front = [], current = h, back = t ++ c : b}
-
-back' :: PointedList a -> PointedList a
-back' list@PointedList {back = []} = list
-back' PointedList {front = f, current = c, back = b} =
-  let h:t = reverse b
-   in PointedList {front = t ++ c : f, current = h, back = []}
-
-refresh :: Model -> IO Model
-refresh state@Model {posts = list@PointedList {current = c}} =
-  case c of
-    Downloaded p _ ->
-      writeChan (downloadChannel state) p >> writeChan (downloadChannel state) p >>
-      return state {posts = list {current = Submitted p}}
-    Submitted _ -> return state -- do nothing, is already submitted
-    Deleted i -> refresh' i
-    Failed i -> refresh' i
+refresh :: ModelM ()
+refresh =
+  (^. current) <$> use posts >>= \case
+    Downloaded post _ -> downloadLink post
+    Submitted _ -> return () -- do nothing, is already submitted
+    Deleted postId -> downloadPost postId
+    Failed postId -> downloadPost postId
   where
-    refresh' :: R.PostID -> IO Model
-    refresh' i =
-      R.runRedditWith redditOptions (R.getPostInfo i) >>= \case
-        Left msg ->
-          putStrLn ("Failed to download " ++ show i) >>
-          putStrLn ("Message: " ++ show msg) >>
-          return state
-        Right p ->
-          case R.content p of
-            R.Link _ ->
-              writeChan (downloadChannel state) p >>
-              return state {posts = list {current = Submitted p}}
-            _ -> return state
-    redditOptions :: R.RedditOptions
-    redditOptions =
-      R.defaultRedditOptions
-        {R.customUserAgent = Just "Haskell reddit image viewer (by /u/rmanne)"}
+    downloadLink :: R.Post -> ModelM ()
+    downloadLink post =
+      use downloadChannel >>= \channel ->
+        lift (writeChan channel post) >> posts %= (current .~ Submitted post)
+    downloadPost :: R.PostID -> ModelM ()
+    downloadPost postId =
+      redditOptionsFor <$> use config <*>
+      ((\(R.R arg) -> arg) <$> use subredditName) >>= \(redditOptions, _) ->
+        R.runRedditWith redditOptions (R.getPostInfo postId) >>= \case
+          Left msg ->
+            lift (putStrLn ("Failed to download " <> show postId)) >>
+            lift (putStrLn ("Message: " <> show msg))
+          Right post ->
+            case R.content post of
+              R.Link _ -> downloadLink post
+              _ -> return ()
 
-next :: Model -> IO Model
-next state@Model { skipDeleted = sd
-                 , posts = list@PointedList {front = _, current = c, back = b}
-                 } =
-  case b of
-    [] ->
-      redditGet
-        (config state)
-        (subredditName state)
-        (Just $ R.After $ postId c)
-        (downloadChannel state) >>= \case
-        [] -> return state
-        b' -> next state {posts = list {back = b'}}
-    Deleted _:_
-      | sd -> next state {posts = next' list}
-    _ -> return state {posts = next' list, currentIndex = 0}
+type ModelM = State.StateT Model IO
 
-nextUntilFailed :: Model -> IO Model
-nextUntilFailed state =
-  if isFailed (current (posts state)) ||
-     all (not . isFailed) (back (posts state))
-    then return state
-    else next state >>= nextUntilFailed
+isDeleted :: Post -> Bool
+isDeleted (Deleted _) = True
+isDeleted _ = False
+
+next :: ModelM ()
+next =
+  goNext <$> use posts >>= \case
+    Just posts' ->
+      posts .= posts' >>
+      whenM
+        (use skipDeleted)
+        (if isDeleted (posts' ^. current)
+           then next
+           else currentIndex .= 0)
+    Nothing ->
+      Just . R.Before . postId . (^. current) <$> use posts >>= redditGetT >>= \case
+        [] -> return ()
+        elements -> posts %= addToBack elements >> next
+
+nextUntilFailed :: ModelM ()
+nextUntilFailed =
+  all (not . isFailed) . (^. back) <$> use posts >>= \case
+    True -> return ()
+    False -> next `untilM_` (isFailed . (^. current) <$> use posts)
   where
     isFailed (Failed _) = True
     isFailed _ = False
 
-prev :: Model -> IO Model
-prev state@Model { skipDeleted = sd
-                 , posts = list@PointedList {front = f, current = c, back = b}
-                 } =
-  case f of
-    [] ->
-      redditGet
-        (config state)
-        (subredditName state)
-        (Just $ R.Before $ postId c)
-        (downloadChannel state) >>= \case
-        [] ->
-          case b of
-            [] -> return state
-            c':_ -- maybe c is deleted, try c'
-             ->
-              redditGet
-                (config state)
-                (subredditName state)
-                (Just $ R.Before $ postId c')
-                (downloadChannel state) >>= \case
-                [] -> return state -- c' is deleted too...
-                f'
-                  | any (\c'' -> postId c == postId c'') f' ->
-                    trace "Here" $ return state -- c isn't deleted, just return even if we can do better
-                f' -> prev state {posts = list {front = reverse f'}}
-        f' -> prev state {posts = list {front = reverse f'}}
-    Deleted _:_
-      | sd -> prev state {posts = prev' list}
-    _ -> return state {posts = prev' list, currentIndex = 0}
+prev :: ModelM ()
+prev =
+  goPrev <$> use posts >>= \case
+    Just posts' ->
+      posts .= posts' >>
+      whenM
+        (use skipDeleted)
+        (if isDeleted (posts' ^. current)
+           then prev
+           else currentIndex .= 0)
+    Nothing ->
+      (^. current) <$> use posts >>= \currentPost ->
+        redditGetT (Just $ R.Before $ postId currentPost) >>= \case
+          [] ->
+            Just . R.Before . postId . head . (^. back) <$> use posts >>=
+            redditGetT >>= {- Maybe currentPost is deleted, so try the next one as well -}
+             \case
+              [] -> return () -- both posts might be deleted, just give up
+              elements
+                | all
+                   (\element -> postId element /= postId currentPost)
+                   elements -> posts %= addToFront elements >> prev
+              _ -> return () -- current isn't deleted, just return even if we can do better
+          elements -> posts %= addToFront elements >> prev
 
 slideshowWorker :: Chan Command -> IO ()
 slideshowWorker channel =
   threadDelay 3000000 >> writeChan channel Next >> slideshowWorker channel
 
-display :: IORef (Maybe View) -> Model -> IO Model
-display ref state =
-  writeIORef ref (Just (current $ posts state, currentIndex state)) >>
-  return state
+display :: IORef (Maybe View) -> ModelM ()
+display ref =
+  (,) <$> ((^. current) <$> use posts) <*> use currentIndex >>=
+  lift . writeIORef ref . Just
 
-processAndDisplay :: IORef (Maybe View) -> Model -> IO Model
-processAndDisplay ref state@Model {posts = list@PointedList {current = c}} =
-  case c of
-    (Submitted p) ->
-      display ref $
-      case Map.lookup (R.postID p) (downloaded state) of
-        Nothing -> state
-        Just fs ->
-          state
-            { posts =
-                list
-                  { current =
-                      if null fs
-                        then Failed (R.postID p)
-                        else Downloaded p fs
-                  }
-            , downloaded = Map.delete (R.postID p) (downloaded state)
-            }
-    _ -> display ref state
+processAndDisplay :: IORef (Maybe View) -> ModelM ()
+processAndDisplay ref = commitState >> display ref
+  where
+    commitState :: ModelM ()
+    commitState =
+      (^. current) <$> use posts >>= \case
+        (Submitted post) ->
+          Map.updateLookupWithKey (\_ _ -> Nothing) (R.postID post) <$>
+          use downloaded >>= \case
+            (Nothing, _) -> return ()
+            (Just [], newMap) ->
+              posts %= (current .~ Failed (R.postID post)) >>
+              downloaded .= newMap
+            (Just files, newMap) ->
+              posts %= (current .~ Downloaded post files) >>
+              downloaded .= newMap
+        _ -> return ()
 
 saveSender :: Chan Command -> IO ()
 saveSender channel =
@@ -342,21 +386,19 @@ model subr ref channel = do
   _ <- forkIO $ saveSender channel
   dlchannel <- newChan
   initialPosts <- load config subr dlchannel
-  initialState <-
-    processAndDisplay
-      ref
-      Model
-        { posts = initialPosts
-        , subredditName = R.R (Text.pack subr)
-        , downloadChannel = dlchannel
-        , skipDeleted = True
-        , downloaded = Map.empty
-        , downloadedMulti = Map.empty
-        , slideshowThread = Nothing
-        , multi = 1
-        , currentIndex = 0
-        , config = config
-        }
+  let initialState =
+        Model
+          { _posts = initialPosts
+          , _subredditName = R.R (Text.pack subr)
+          , _downloadChannel = dlchannel
+          , _skipDeleted = True
+          , _downloaded = Map.empty
+          , _downloadedMulti = Map.empty
+          , _slideshowThread = Nothing
+          , _multi = 1
+          , _currentIndex = 0
+          , _config = config
+          }
   aria2InputChan <- newChan
   aria2OutputChan <- newChan
   _ <-
@@ -372,157 +414,91 @@ model subr ref channel = do
     mapM_
       (\((pid, index, length, fname), result) ->
          case result of
-           Left msg -> print msg >> writeChan channel (Download pid index length [])
+           Left msg ->
+             print msg >> writeChan channel (Download pid index length [])
            Right f' ->
              renameFile (Text.unpack f') fname >>
              writeChan channel (Download pid index length [fname]))
-  _ <- forkIO (downloadWorker config channel dlchannel aria2InputChan)
-  _ <- forkIO (downloadWorker config channel dlchannel aria2InputChan)
-  _ <- forkIO (downloadWorker config channel dlchannel aria2InputChan)
-  _ <- forkIO (downloadWorker config channel dlchannel aria2InputChan)
-  _ <- forkIO (downloadWorker config channel dlchannel aria2InputChan)
-  _ <- forkIO (downloadWorker config channel dlchannel aria2InputChan)
-  getChanContents channel >>=
-    foldM_
-      (\state ->
-         \case
-           Next ->
-             foldM
-               (\state' _ -> next state' {multi = 1})
-               state
-               [(1 :: Int) .. (multi state)] >>=
-             processAndDisplay ref
-           Prev ->
-             foldM
-               (\state' _ -> prev state' {multi = 1})
-               state
-               [(1 :: Int) .. (multi state)] >>=
-             processAndDisplay ref
-           Toggle ->
-             case slideshowThread state of
-               Nothing ->
-                 forkIO (slideshowWorker channel) >>= \threadId ->
-                   return state {slideshowThread = Just threadId, multi = 1}
-               Just threadId ->
-                 killThread threadId >>
-                 return state {slideshowThread = Nothing, multi = 1}
-           Remove ->
-             case current (posts state) of
-               Downloaded p f ->
-                 mapM_ removeFile f `catch` (\SomeException {} -> return ()) >>
-                 next
-                   (state
-                      { posts = (posts state) {current = Deleted (R.postID p)}
-                      , multi = 1
-                      }) >>=
-                 processAndDisplay ref
-               Failed p ->
-                 next
-                   (state
-                      {posts = (posts state) {current = Deleted p}, multi = 1}) >>=
-                 processAndDisplay ref
-               _ -> return state {multi = 1}
-           Save -> save state >> return state {multi = 1}
-           ToggleDeleted ->
-             return state {skipDeleted = not (skipDeleted state), multi = 1}
-           Refresh -> refresh state {multi = 1, currentIndex = 0}
-           Front ->
-             processAndDisplay
-               ref
-               state {posts = front' (posts state), multi = 1, currentIndex = 0}
-           Back ->
-             processAndDisplay
-               ref
-               state {posts = back' (posts state), multi = 1, currentIndex = 0}
-           Commit ->
-             let Model { posts = PointedList {front = f, current = c, back = b}
-                       , downloaded = dlmap
-                       } = state
-              in return
-                   state
-                     { posts =
-                         PointedList
-                           { front = map (fillPost dlmap) f
-                           , current = fillPost dlmap c
-                           , back = map (fillPost dlmap) b
-                           }
-                     , downloaded = Map.empty
-                     , multi = 1
-                     }
-           FindFailed ->
-             nextUntilFailed state {multi = 1} >>= processAndDisplay ref
-           Status ->
-             let Model { posts = PointedList {front = f, current = c, back = b}
-                       , downloaded = dlmap
-                       } = state
-              in do putStrLn $ "Downloaded: " <> show dlmap
-                    return state {multi = 1}
-           NextImage ->
-             processAndDisplay ref state {currentIndex = currentIndex state - 1}
-           PrevImage ->
-             processAndDisplay ref state {currentIndex = currentIndex state + 1}
-           Multi num -> return state {multi = num}
-           Download i 1 1 f ->
-             case current (posts state) of
-               Submitted p
-                 | i == R.postID p ->
-                   processAndDisplay
-                     ref
-                     state
-                       { posts =
-                           (posts state)
-                             { current =
-                                 if null f
-                                   then Failed i
-                                   else Downloaded p f
-                             }
-                       }
-               _ ->
-                 return state {downloaded = Map.insert i f (downloaded state)}
-           Download postId index length f ->
-             if all
-                  id
-                  (map
-                     (\i' -> Map.member (postId, i') (downloadedMulti state))
-                     (filter (/= index) [1 .. length]))
-               then let [f'] = f
-                        files =
-                          map
-                            (\i' ->
-                               if i' == index
-                                 then f'
-                                 else (downloadedMulti state) Map.! (postId, i'))
-                            [1 .. length]
-                     in case current (posts state) of
-                          Submitted p
-                            | postId == R.postID p ->
-                              processAndDisplay
-                                ref
-                                state
-                                  { posts =
-                                      (posts state)
-                                        { current =
-                                            if null files
-                                              then Failed postId
-                                              else Downloaded p files
-                                        }
-                                  }
-                          _ ->
-                            return
-                              state
-                                { downloaded =
-                                    Map.insert postId files (downloaded state)
-                                }
-               else let [f'] = f
-                     in return
-                          state
-                            { downloadedMulti =
-                                Map.insert
-                                  (postId, index)
-                                  f'
-                                  (downloadedMulti state)
-                            })
-      initialState
+  _ <-
+    replicateM_
+      6
+      (forkIO (downloadWorker config channel dlchannel aria2InputChan))
+  State.evalStateT
+    (display ref >> lift (getChanContents channel) >>=
+     mapM_ (model' ref channel))
+    initialState
+  where
+    fillPost :: Map R.PostID [FilePath] -> Post -> Post
+    fillPost map (Submitted p) =
+      case Map.lookup (R.postID p) map of
+        Just f
+          | not (null f) -> Downloaded p f
+        Just [] -> Failed (R.postID p)
+        Nothing -> Submitted p
+    fillPost map p = p
+
+model' :: IORef (Maybe View) -> Chan Command -> Command -> ModelM ()
+model' ref channel =
+  \case
+    Next -> use multi >>= flip replicateM_ next >> multi .= 1
+    Prev -> use multi >>= flip replicateM_ prev >> multi .= 1
+    Toggle ->
+      use slideshowThread >>= \case
+        Nothing ->
+          lift (forkIO (slideshowWorker channel)) >>= \threadId ->
+            slideshowThread .= Just threadId >> multi .= 1
+        Just threadId ->
+          lift (killThread threadId) >> slideshowThread .= Nothing >> multi .= 1
+    Remove ->
+      (^. current) <$> use posts >>= \case
+        Downloaded post files ->
+          mapM_
+            (\file ->
+               lift (removeFile file `catch` (\SomeException {} -> return ())))
+            files >>
+          posts %= (current .~ Deleted (R.postID post)) >>
+          multi .= 1 >>
+          next >>
+          processAndDisplay ref
+        Failed postId ->
+          posts %= (current .~ Deleted postId) >> multi .= 1 >> next >>
+          processAndDisplay ref
+        _ -> multi .= 1
+    Save -> save
+    ToggleDeleted -> skipDeleted %= not >> multi .= 1
+    Refresh -> refresh >> multi .= 1 >> currentIndex .= 0
+    Front ->
+      posts %= goToFront >> multi .= 1 >> currentIndex .= 0 >>
+      processAndDisplay ref
+    Back ->
+      posts %= goToBack >> multi .= 1 >> currentIndex .= 0 >>
+      processAndDisplay ref
+    Commit ->
+      use downloaded >>= \dlmap ->
+        posts %= fmap (fillPost dlmap) >> multi .= 1 >> downloaded .= Map.empty
+    FindFailed -> nextUntilFailed >> multi .= 1 >> processAndDisplay ref
+    Status ->
+      multi .= 1 >> use downloaded >>=
+      lift . putStrLn . ("Downloaded: " <>) . show
+    NextImage ->
+      use multi >>= (currentIndex +=) >> multi .= 1 >> processAndDisplay ref
+    PrevImage ->
+      use multi >>= (currentIndex -=) >> multi .= 1 >> processAndDisplay ref
+    Multi num -> multi .= num
+    Download postId 1 1 file -- single-file post
+     -> downloaded %= Map.insert postId file >> processAndDisplay ref
+    Download postId index length [file] ->
+      downloadedMulti %= Map.insert (postId, index) file >>
+      (\multiMap ->
+         map (\index -> Map.lookup (postId, index) multiMap) [1 .. length]) <$>
+      use downloadedMulti >>= \results ->
+        when
+          (all isJust results)
+          (downloaded %= Map.insert postId (catMaybes results) >>
+           mapM_
+             (\index -> downloadedMulti %= Map.delete (postId, index))
+             [1 .. length]) >>
+        processAndDisplay ref
   where
     fillPost :: Map R.PostID [FilePath] -> Post -> Post
     fillPost map (Submitted p) =
@@ -557,26 +533,26 @@ downloadPost config channel aria2InputChan p@R.Post { R.content = R.Link txt
   case dl of
     _:_ -> do
       let dname =
-            path config ++
-            Text.unpack
-              (let R.R subr = R.subreddit p
-                in subr)
+            Text.unpack $
+            path config <>
+            (let R.R subr = R.subreddit p
+              in subr)
       createDirectoryIfMissing False dname
       forM_ (zip [1 ..] dl) $ \(i, dl') -> do
         let fname =
               if length dl == 1
-                then dname ++ "/" ++ Text.unpack pid ++ takeExtension dl'
-                else dname ++
-                     "/" ++
-                     Text.unpack pid ++ "-" ++ show i ++ takeExtension dl'
+                then dname <> "/" <> Text.unpack pid <> takeExtension dl'
+                else dname <>
+                     "/" <>
+                     Text.unpack pid <> "-" <> show i <> takeExtension dl'
         doesFileExist fname >>= \case
           True -> do
             putStrLn $
-              "File exists " ++ link ++ " (" ++ dl' ++ ") into " ++ fname
+              "File exists " <> link <> " (" <> dl' <> ") into " <> fname
             writeChan channel (Download (R.postID p) i (length dl) [fname])
           False -> do
             putStrLn $
-              "Downloading " ++ link ++ " (" ++ dl' ++ ") into " ++ fname
+              "Downloading " <> link <> " (" <> dl' <> ") into " <> fname
             writeChan
               aria2InputChan
               ((R.postID p, i, length dl, fname), Text.pack dl')

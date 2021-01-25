@@ -5,42 +5,81 @@ module View
 import qualified Codec.FFmpeg as FFmpeg
 import qualified Codec.FFmpeg.Common as FFmpegCommon
 import qualified Codec.FFmpeg.Decode as FFmpeg
-import Control.Monad.Except(runExceptT, when)
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Chan (Chan, writeChan)
+import Control.Monad (join)
+import Control.Monad.Except (runExceptT, when)
+import Control.Monad.Trans.Class (lift)
+import qualified Control.Monad.Trans.State.Strict as State
 import Data.ByteString (ByteString)
 import Data.ByteString.Unsafe (unsafePackCStringFinalizer)
+import Data.Default (Default(def))
+import Data.IORef (IORef, atomicModifyIORef, newIORef)
 import Data.Text (Text)
-import Data.IORef(atomicModifyIORef, IORef)
-import Foreign.C.Types(CInt)
-import Foreign.Ptr(castPtr)
-import Control.Concurrent.Chan (Chan, writeChan)
 import qualified Data.Text as Text
 import Data.Time.Calendar (toGregorian)
 import Data.Time.Clock (utctDay)
+import EventHandler
+import Foreign.C.Types (CInt)
+import Foreign.Ptr (castPtr)
 import qualified Reddit.Types.Listing as R
 import qualified Reddit.Types.Post as R
 import qualified SDL
 import Types
 
+-- TODO: Audio
+-- https://hackage.haskell.org/package/sdl2-2.5.3.0/docs/SDL-Audio.html
+-- https://github.com/fosterseth/sdl2_video_player/blob/master/vidserv.c
+-- https://github.com/acowley/ffmpeg-light/tree/audio
+-- https://github.com/acowley/ffmpeg-light/issues/21
+-- https://github.com/acowley/ffmpeg-light/compare/audio#diff-cbdc928a28fd3b49d906aab9cdb228bc31f3d3017fcbb6b411082f6a3feb6fa7
+-- TODO: Render text
+-- https://hackage.haskell.org/package/sdl2-ttf-2.1.1/docs/SDL-Font.html
 data ViewResources =
   ViewResources
-    { window :: SDL.Window
+    { modelChannel :: Chan Command
+    , window :: SDL.Window
     , renderer :: SDL.Renderer
-    , nextFrame :: IO ()
-    , newNextFrame :: CInt -> CInt -> IO ()
+    , renderingContextBuilder :: CInt -> CInt -> RenderingContext
+    , renderingContext :: RenderingContext
+    , nextFrame :: ViewIO ()
+    , currentFrame :: ViewIO ()
     , cleanup :: IO ()
     , windowWidth :: CInt
     , windowHeight :: CInt
-    , quitting :: Bool
+    , quit :: Bool
     }
+
+type ViewIO = State.StateT ViewResources IO
 
 -- | This should be run in the main thread. This function will not return until the view is closed.
 view :: Chan Command -> IORef (Maybe View) -> IO ()
 view controllerChannel viewRef = do
   FFmpeg.initFFmpeg
   SDL.initializeAll
-  viewResources <- createViewResources
-  viewLoop controllerChannel viewRef viewResources
-  destroyViewResources viewResources
+  window <-
+    SDL.createWindow "Loading..." SDL.defaultWindow {SDL.windowResizable = True}
+  renderer <- SDL.createRenderer window (-1) SDL.defaultRenderer
+  SDL.rendererDrawColor renderer SDL.$= SDL.V4 0 0 0 255
+  SDL.clear renderer
+  let viewResources =
+        ViewResources
+          { modelChannel = controllerChannel
+          , window = window
+          , renderer = renderer
+          , renderingContextBuilder = \_ _ -> def
+          , renderingContext = def
+          , nextFrame = return ()
+          , currentFrame = return ()
+          , cleanup = return ()
+          , windowHeight = 100
+          , windowWidth = 100
+          , quit = False
+          }
+  viewResources' <- State.execStateT (viewLoop viewRef) viewResources
+  cleanup viewResources'
+  SDL.destroyRenderer renderer
+  SDL.destroyWindow window
   SDL.quit
 
 viewToTitleFile :: View -> (String, Maybe FilePath)
@@ -64,23 +103,33 @@ viewToTitleFile (Downloaded post files, currentIndex) =
         show currentIndex' <>
         "/" <>
         show (length files) <>
-        "] [" <> show (R.postID post) <> "] " <> Text.unpack (R.title post)
+        "] [" <>
+        (let R.PostID postId = R.postID post
+          in Text.unpack postId) <>
+        "] " <> Text.unpack (R.title post)
       , Just (files !! currentIndex'))
 
-newNextFrameGenerator ::
-     CInt
-  -> CInt
-  -> SDL.Renderer
+data RenderingContext =
+  RenderingContext
+    { destinationRectangle :: SDL.Rectangle CInt
+    }
+
+instance Default RenderingContext where
+  def = RenderingContext $ SDL.Rectangle (SDL.P (SDL.V2 0 0)) (SDL.V2 0 0)
+
+renderingGenerator ::
+     SDL.Renderer
   -> FilePath
-  -> IO (CInt -> CInt -> IO (), IO ())
-newNextFrameGenerator currentWindowWidth currentWindowHeight renderer file = do
+  -> IO (CInt -> CInt -> RenderingContext, ViewIO (), ViewIO (), IO ())
+renderingGenerator renderer file = do
   (reader, cleanup) <-
     runExceptT (FFmpeg.frameReaderTime FFmpeg.avPixFmtRgb24 (FFmpeg.File file)) >>= \case
       Right v -> return v
       Left msg -> fail msg
-  (firstFrame, firstFrameTime) <- reader >>= \case
-    Nothing -> fail "First frame is empty"
-    Just v -> return v
+  (firstFrame, firstFrameTime) <-
+    reader >>= \case
+      Nothing -> fail "First frame is empty"
+      Just v -> return v
   Just imageBufferSize <- FFmpegCommon.frameBufferSize firstFrame
   Just imageLineSize <- FFmpegCommon.frameLineSize firstFrame
   unsafeImageBuffer <- FFmpegCommon.av_malloc (fromIntegral imageBufferSize)
@@ -98,20 +147,27 @@ newNextFrameGenerator currentWindowWidth currentWindowHeight renderer file = do
       SDL.TextureAccessStreaming
       (SDL.V2 textureWidth textureHeight)
   startTime <- SDL.time
-  let renderFrame (frame, time) destinationRectangle = do
-        currentTime <- SDL.time
-        when (currentTime < startTime + time) $
-          SDL.delay $ sec2msec $ startTime + time - currentTime
+  let currentFrame =
+        State.gets renderingContext >>= \RenderingContext {destinationRectangle} -> do
+          SDL.clear renderer
+          SDL.copy renderer texture Nothing (Just destinationRectangle)
+          SDL.present renderer
+      updateTexture frame = do
         Just _ <-
           FFmpegCommon.frameCopyToBuffer frame (castPtr unsafeImageBuffer)
         _ <- SDL.updateTexture texture Nothing imageBuffer imageLineSize
-        SDL.clear renderer
-        SDL.copy renderer texture Nothing (Just destinationRectangle)
-        SDL.present renderer
-      nextFrame destinationRectangle =
-        reader >>= \case
-          Nothing -> SDL.delay 100 >> return ()
-          Just (frame, time) -> renderFrame (frame, time) destinationRectangle
+        return ()
+      nextFrame =
+        lift
+          (reader >>= \case
+             Nothing -> threadDelay 30000
+             Just (frame, time) -> do
+               currentTime <- SDL.time
+               when (currentTime < startTime + time) $
+                 threadDelay $
+                 floor $ (* 1000000) $ startTime + time - currentTime
+               updateTexture frame) >>
+        currentFrame
       rectangleFor windowWidth windowHeight =
         let scaleWidth :: Double
             scaleWidth = fromIntegral textureWidth / fromIntegral windowWidth
@@ -129,177 +185,73 @@ newNextFrameGenerator currentWindowWidth currentWindowHeight renderer file = do
          in SDL.Rectangle
               (SDL.P (SDL.V2 horizontalOffset verticalOffset))
               (SDL.V2 scaledWidth scaledHeight)
-      newNextFrame windowWidth windowHeight =
-        nextFrame (rectangleFor windowWidth windowHeight)
-  renderFrame
-    (firstFrame, firstFrameTime)
-    (rectangleFor currentWindowWidth currentWindowHeight)
-  return (newNextFrame, SDL.destroyTexture texture >> cleanup)
-
-viewLoopNoEvents :: Chan Command -> IORef (Maybe View) -> ViewResources -> IO ()
-viewLoopNoEvents controllerChannel viewRef viewResources =
-  atomicModifyIORef viewRef (Nothing, ) >>= \case
-    Just view -> do
-      _ <- cleanup viewResources
-      let (title, file) = viewToTitleFile view
-      print (title, file)
-      SDL.windowTitle (window viewResources) SDL.$= Text.pack title
-      case file of
-        Nothing -> do
-          SDL.clear (renderer viewResources)
-          SDL.present (renderer viewResources)
-          viewLoop
-            controllerChannel
-            viewRef
-            viewResources
-              { newNextFrame = \_ _ -> return ()
-              , nextFrame = return ()
-              , cleanup = return ()
-              }
-        Just file' -> do
-          (newNextFrame', cleanup') <-
-            newNextFrameGenerator
-              (windowWidth viewResources)
-              (windowHeight viewResources)
-              (renderer viewResources)
-              file'
-          viewLoop
-            controllerChannel
-            viewRef
-            viewResources
-              { newNextFrame = newNextFrame'
-              , nextFrame =
-                  newNextFrame'
-                    (windowWidth viewResources)
-                    (windowHeight viewResources)
-              , cleanup = cleanup'
-              }
-    Nothing ->
-      nextFrame viewResources >>
-      viewLoop controllerChannel viewRef viewResources
-
-viewLoop :: Chan Command -> IORef (Maybe View) -> ViewResources -> IO ()
-viewLoop _ _ ViewResources {quitting = True} = return ()
-viewLoop controllerChannel viewRef viewResources =
-  SDL.pollEvents >>= \case
-    [] -> viewLoopNoEvents controllerChannel viewRef viewResources
-    events ->
-      eventLoop controllerChannel viewResources events >>=
-      viewLoop controllerChannel viewRef
-
-eventLoop :: Chan Command -> ViewResources -> [SDL.Event] -> IO ViewResources
-eventLoop _ viewResources [] = return viewResources
-eventLoop controllerChannel viewResources (SDL.Event {SDL.eventPayload = SDL.WindowSizeChangedEvent SDL.WindowSizeChangedEventData {SDL.windowSizeChangedEventSize = SDL.V2 width height}}:remainingEvents) =
-  eventLoop
-    controllerChannel
-    viewResources
-      { windowWidth = fromIntegral width
-      , windowHeight = fromIntegral height
-      , nextFrame =
-          newNextFrame viewResources
-            (fromIntegral width)
-            (fromIntegral height)
-      }
-    remainingEvents
-eventLoop controllerChannel viewResources (SDL.Event {SDL.eventPayload = SDL.QuitEvent}:remainingEvents) =
-  print "QuitEvent" >> return viewResources {quitting = True}
-eventLoop controllerChannel viewResources (SDL.Event {SDL.eventPayload = SDL.KeyboardEvent SDL.KeyboardEventData { SDL.keyboardEventKeysym = keysym
-                                                                                                                 , SDL.keyboardEventKeyMotion = SDL.Released
-                                                                                                                 }}:remainingEvents) =
-  case SDL.keysymModifier keysym of
-    SDL.KeyModifier { SDL.keyModifierLeftShift = False
-                    , SDL.keyModifierRightShift = False
-                    , SDL.keyModifierLeftCtrl = False
-                    , SDL.keyModifierRightCtrl = False
-                    , SDL.keyModifierLeftAlt = False
-                    , SDL.keyModifierRightAlt = False
-                    , SDL.keyModifierLeftGUI = False
-                    , SDL.keyModifierRightGUI = False
-                    , SDL.keyModifierNumLock = False
-                    , SDL.keyModifierCapsLock = False
-                    , SDL.keyModifierAltGr = False
-                    } ->
-      case SDL.keysymKeycode keysym of
-        SDL.KeycodeQ -> return viewResources {quitting = True}
-        SDL.KeycodeJ -> nextLoop Next
-        SDL.KeycodeK -> nextLoop Prev
-        SDL.KeycodeS -> nextLoop Toggle
-        SDL.KeycodeD -> nextLoop Remove
-        SDL.KeycodeW -> nextLoop Save
-        SDL.KeycodeV -> nextLoop ToggleDeleted
-        SDL.KeycodeR -> nextLoop Refresh
-        SDL.KeycodeG -> nextLoop Front
-        SDL.KeycodeC -> nextLoop Commit
-        SDL.KeycodeF -> nextLoop FindFailed
-        SDL.KeycodeA -> nextLoop Status
-        SDL.KeycodeL -> nextLoop NextImage
-        SDL.KeycodeH -> nextLoop PrevImage
-        SDL.Keycode0 -> nextLoop (Multi 0)
-        SDL.Keycode1 -> nextLoop (Multi 1)
-        SDL.Keycode2 -> nextLoop (Multi 2)
-        SDL.Keycode3 -> nextLoop (Multi 3)
-        SDL.Keycode4 -> nextLoop (Multi 4)
-        SDL.Keycode5 -> nextLoop (Multi 5)
-        SDL.Keycode6 -> nextLoop (Multi 6)
-        SDL.Keycode7 -> nextLoop (Multi 7)
-        SDL.Keycode8 -> nextLoop (Multi 8)
-        SDL.Keycode9 -> nextLoop (Multi 9)
-        _ -> eventLoop controllerChannel viewResources remainingEvents
-    SDL.KeyModifier { SDL.keyModifierLeftShift = lshift
-                    , SDL.keyModifierRightShift = rshift
-                    , SDL.keyModifierLeftCtrl = False
-                    , SDL.keyModifierRightCtrl = False
-                    , SDL.keyModifierLeftAlt = False
-                    , SDL.keyModifierRightAlt = False
-                    , SDL.keyModifierLeftGUI = False
-                    , SDL.keyModifierRightGUI = False
-                    , SDL.keyModifierNumLock = False
-                    , SDL.keyModifierCapsLock = False
-                    , SDL.keyModifierAltGr = False
-                    }
-      | lshift || rshift ->
-        case SDL.keysymKeycode keysym of
-          SDL.KeycodeQ -> return viewResources {quitting = True}
-          SDL.KeycodeG -> nextLoop Back
-          _ -> eventLoop controllerChannel viewResources remainingEvents
-    _ -> eventLoop controllerChannel viewResources remainingEvents
-  where
-    nextLoop command =
-      writeChan controllerChannel command >>
-      eventLoop controllerChannel viewResources remainingEvents
-eventLoop controllerChannel viewResources (_:remainingEvents) =
-  eventLoop controllerChannel viewResources remainingEvents
-
--- Create window, renderer and texture.
-createViewResources :: IO ViewResources
-createViewResources = do
-  window <- createWindow
-  renderer <- createRenderer window
-  SDL.rendererDrawColor renderer SDL.$= SDL.V4 0 0 0 255
-  SDL.clear renderer
+  updateTexture firstFrame
   return
-    ViewResources
-      { window = window
-      , renderer = renderer
+    ( \width height -> RenderingContext (rectangleFor width height)
+    , nextFrame
+    , currentFrame
+    , SDL.destroyTexture texture >> cleanup)
+
+switchFile :: Maybe FilePath -> ViewIO ()
+switchFile Nothing = do
+  renderer <- State.gets renderer
+  lift $ SDL.clear renderer
+  lift $ SDL.present renderer
+  State.modify $ \viewResources ->
+    viewResources
+      { renderingContextBuilder = \_ _ -> def
+      , renderingContext = def
       , nextFrame = return ()
-      , newNextFrame = \_ _ -> return ()
+      , currentFrame = return ()
       , cleanup = return ()
-      , windowHeight = 100
-      , windowWidth = 100
-      , quitting = False
       }
+switchFile (Just file) = do
+  renderer <- State.gets renderer
+  (renderingContextBuilder, nextFrame, currentFrame, cleanup) <-
+    lift $ renderingGenerator renderer file
+  renderingContext <-
+    renderingContextBuilder <$> State.gets windowWidth <*>
+    State.gets windowHeight
+  State.modify $ \viewResources ->
+    viewResources
+      { renderingContextBuilder = renderingContextBuilder
+      , renderingContext = renderingContext
+      , nextFrame = nextFrame
+      , currentFrame = currentFrame
+      , cleanup = cleanup
+      }
+  currentFrame
+
+viewLoop :: IORef (Maybe View) -> ViewIO ()
+viewLoop viewRef =
+  SDL.mapEvents processEventT >> State.gets quit >>= \case
+    True -> return ()
+    False ->
+      lift (atomicModifyIORef viewRef (Nothing, )) >>= \case
+        Nothing -> join (State.gets nextFrame) >> viewLoop viewRef
+        Just view -> do
+          State.gets cleanup >>= lift
+          let (title, file) = viewToTitleFile view
+          lift $ print (title, file)
+          State.gets window >>= \window ->
+            SDL.windowTitle window SDL.$= Text.pack title
+          switchFile file
+          viewLoop viewRef
   where
-    createWindow =
-      SDL.createWindow
-        "Loading..."
-        SDL.defaultWindow {SDL.windowResizable = True}
-    -- Create renderer using driver from config.
-    createRenderer window = SDL.createRenderer window (-1) SDL.defaultRenderer
-
-destroyViewResources :: ViewResources -> IO ()
-destroyViewResources ViewResources {cleanup, window, renderer} =
-  cleanup >> SDL.destroyRenderer renderer >> SDL.destroyWindow window
-
--- Convert floating point second to millisecond.
-sec2msec :: (RealFrac a, Integral b) => a -> b
-sec2msec = floor . (* 1000)
+    processEventT :: SDL.Event -> ViewIO ()
+    processEventT event =
+      State.gets modelChannel >>= \modelChannel ->
+        lift (processEvent modelChannel event) >>= \case
+          Just Quit ->
+            State.modify $ \viewResources -> viewResources {quit = True}
+          Just (ResizeWindow width height) ->
+            State.gets renderingContextBuilder >>= \builder ->
+              State.modify
+                (\viewResources ->
+                   viewResources
+                     { windowWidth = width
+                     , windowHeight = height
+                     , renderingContext = builder width height
+                     }) >>
+              join (State.gets currentFrame)
+          Nothing -> return ()

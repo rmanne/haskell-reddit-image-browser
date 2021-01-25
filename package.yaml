@@ -46,6 +46,7 @@ dependencies:
 - vector
 - unordered-containers
 - yaml
+- data-default
 
 default-extensions:
 - LambdaCase
