@@ -11,7 +11,7 @@ import Control.Concurrent.Chan(newChan)
 main :: IO ()
 main = do
   [subr] <- getArgs
-  viewRef <- newIORef Nothing
-  requestChannel <- newChan
-  _ <- forkIO $ model subr viewRef requestChannel
-  view requestChannel viewRef
+  modelChannel <- newChan
+  viewChannel <- newChan
+  _ <- forkIO $ model subr modelChannel viewChannel
+  view modelChannel viewChannel

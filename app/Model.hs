@@ -78,6 +78,9 @@ import System.Directory
 import System.FilePath.Posix (takeExtension)
 import Text.Read (readEither)
 import Types
+import qualified View.Types as View
+import Data.Time.Calendar (toGregorian)
+import Data.Time.Clock (utctDay)
 
 --import Control.Monad.Extra(whenM)
 whenM :: Monad m => m Bool -> m () -> m ()
@@ -126,6 +129,7 @@ data Model =
     , _multi :: Int
     , _currentIndex :: Int
     , _config :: Config
+    , _viewChannel :: Chan View.Action
     }
 
 $(makeLenses ''Model)
@@ -349,13 +353,43 @@ slideshowWorker :: Chan Command -> IO ()
 slideshowWorker channel =
   threadDelay 3000000 >> writeChan channel Next >> slideshowWorker channel
 
-display :: IORef (Maybe View) -> ModelM ()
-display ref =
-  (,) <$> ((^. current) <$> use posts) <*> use currentIndex >>=
-  lift . writeIORef ref . Just
+viewToTitleFile :: View -> (String, Maybe FilePath)
+viewToTitleFile (Deleted (R.PostID post), _) =
+  ("[Deleted] " <> show post, Nothing)
+viewToTitleFile (Failed (R.PostID post), currentIndex) =
+  ("[Failed] " <> show post, Nothing)
+viewToTitleFile (Submitted post, currentIndex) =
+  ( "[Downloading] " <>
+    (let (_, month, day) = toGregorian $ utctDay (R.created post)
+      in show month <> "/" <> show day) <>
+    " [score=" <> show (R.score post) <> "] " <> Text.unpack (R.title post)
+  , Nothing)
+viewToTitleFile (Downloaded post files, currentIndex) =
+  let currentIndex' = currentIndex `mod` length files
+   in ( (let (_, month, day) = toGregorian $ utctDay (R.created post)
+          in show month <> "/" <> show day) <>
+        " [score=" <>
+        show (R.score post) <>
+        "] [" <>
+        show currentIndex' <>
+        "/" <>
+        show (length files) <>
+        "] [" <>
+        (let R.PostID postId = R.postID post
+          in Text.unpack postId) <>
+        "] " <> Text.unpack (R.title post)
+      , Just (files !! currentIndex'))
 
-processAndDisplay :: IORef (Maybe View) -> ModelM ()
-processAndDisplay ref = commitState >> display ref
+display :: ModelM ()
+display =
+  use viewChannel >>= \channel ->
+    (,) <$> ((^. current) <$> use posts) <*> use currentIndex >>=
+    lift .
+    (\(title, file) -> writeChan channel (View.Update title file)) .
+    viewToTitleFile
+
+processAndDisplay :: ModelM ()
+processAndDisplay = commitState >> display
   where
     commitState :: ModelM ()
     commitState =
@@ -376,8 +410,8 @@ saveSender :: Chan Command -> IO ()
 saveSender channel =
   threadDelay 10000000 >> writeChan channel Save >> saveSender channel
 
-model :: String -> IORef (Maybe View) -> Chan Command -> IO ()
-model subr ref channel = do
+model :: String -> Chan Command -> Chan View.Action -> IO ()
+model subr channel viewChannel = do
   config <-
     getXdgDirectory XdgConfig "hs-reddit-image-browser/config.yaml" >>=
     Yaml.decodeFileEither >>= \case
@@ -398,6 +432,7 @@ model subr ref channel = do
           , _multi = 1
           , _currentIndex = 0
           , _config = config
+          , _viewChannel = viewChannel
           }
   aria2InputChan <- newChan
   aria2OutputChan <- newChan
@@ -424,24 +459,18 @@ model subr ref channel = do
       6
       (forkIO (downloadWorker config channel dlchannel aria2InputChan))
   State.evalStateT
-    (display ref >> lift (getChanContents channel) >>=
-     mapM_ (model' ref channel))
+    (display >> lift (getChanContents channel) >>=
+     mapM_
+       (\command -> lift (print command) >> model' viewChannel channel command))
     initialState
-  where
-    fillPost :: Map R.PostID [FilePath] -> Post -> Post
-    fillPost map (Submitted p) =
-      case Map.lookup (R.postID p) map of
-        Just f
-          | not (null f) -> Downloaded p f
-        Just [] -> Failed (R.postID p)
-        Nothing -> Submitted p
-    fillPost map p = p
 
-model' :: IORef (Maybe View) -> Chan Command -> Command -> ModelM ()
-model' ref channel =
+model' :: Chan View.Action -> Chan Command -> Command -> ModelM ()
+model' viewChannel channel =
   \case
-    Next -> use multi >>= flip replicateM_ next >> multi .= 1
-    Prev -> use multi >>= flip replicateM_ prev >> multi .= 1
+    Next ->
+      use multi >>= flip replicateM_ next >> processAndDisplay >> multi .= 1
+    Prev ->
+      use multi >>= flip replicateM_ prev >> processAndDisplay >> multi .= 1
     Toggle ->
       use slideshowThread >>= \case
         Nothing ->
@@ -459,34 +488,32 @@ model' ref channel =
           posts %= (current .~ Deleted (R.postID post)) >>
           multi .= 1 >>
           next >>
-          processAndDisplay ref
+          processAndDisplay
         Failed postId ->
           posts %= (current .~ Deleted postId) >> multi .= 1 >> next >>
-          processAndDisplay ref
+          processAndDisplay
         _ -> multi .= 1
     Save -> save
     ToggleDeleted -> skipDeleted %= not >> multi .= 1
     Refresh -> refresh >> multi .= 1 >> currentIndex .= 0
     Front ->
-      posts %= goToFront >> multi .= 1 >> currentIndex .= 0 >>
-      processAndDisplay ref
+      posts %= goToFront >> multi .= 1 >> currentIndex .= 0 >> processAndDisplay
     Back ->
-      posts %= goToBack >> multi .= 1 >> currentIndex .= 0 >>
-      processAndDisplay ref
+      posts %= goToBack >> multi .= 1 >> currentIndex .= 0 >> processAndDisplay
     Commit ->
       use downloaded >>= \dlmap ->
         posts %= fmap (fillPost dlmap) >> multi .= 1 >> downloaded .= Map.empty
-    FindFailed -> nextUntilFailed >> multi .= 1 >> processAndDisplay ref
+    FindFailed -> nextUntilFailed >> multi .= 1 >> processAndDisplay
     Status ->
       multi .= 1 >> use downloaded >>=
       lift . putStrLn . ("Downloaded: " <>) . show
     NextImage ->
-      use multi >>= (currentIndex +=) >> multi .= 1 >> processAndDisplay ref
+      use multi >>= (currentIndex +=) >> multi .= 1 >> processAndDisplay
     PrevImage ->
-      use multi >>= (currentIndex -=) >> multi .= 1 >> processAndDisplay ref
+      use multi >>= (currentIndex -=) >> multi .= 1 >> processAndDisplay
     Multi num -> multi .= num
     Download postId 1 1 file -- single-file post
-     -> downloaded %= Map.insert postId file >> processAndDisplay ref
+     -> downloaded %= Map.insert postId file >> processAndDisplay
     Download postId index length [file] ->
       downloadedMulti %= Map.insert (postId, index) file >>
       (\multiMap ->
@@ -498,7 +525,7 @@ model' ref channel =
            mapM_
              (\index -> downloadedMulti %= Map.delete (postId, index))
              [1 .. length]) >>
-        processAndDisplay ref
+        processAndDisplay
   where
     fillPost :: Map R.PostID [FilePath] -> Post -> Post
     fillPost map (Submitted p) =

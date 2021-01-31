@@ -14,18 +14,15 @@ data ViewAction
   | Quit
 
 processEvent :: Chan Command -> SDL.Event -> IO (Maybe ViewAction)
-processEvent chan event =
-  processEventPayload chan (SDL.eventPayload event)
+processEvent chan event = processEventPayload chan (SDL.eventPayload event)
 
-processEventPayload ::
-     Chan Command -> SDL.EventPayload -> IO (Maybe ViewAction)
+processEventPayload :: Chan Command -> SDL.EventPayload -> IO (Maybe ViewAction)
 processEventPayload _ (SDL.WindowSizeChangedEvent SDL.WindowSizeChangedEventData {SDL.windowSizeChangedEventSize = SDL.V2 width height}) =
   return $ Just $ ResizeWindow (fromIntegral width) (fromIntegral height)
-processEventPayload _ SDL.QuitEvent =
-  return $ Just Quit
+processEventPayload _ SDL.QuitEvent = return $ Just Quit
 processEventPayload controllerChannel (SDL.KeyboardEvent SDL.KeyboardEventData { SDL.keyboardEventKeysym = keysym
-                                                                                             , SDL.keyboardEventKeyMotion = SDL.Released
-                                                                                             }) =
+                                                                               , SDL.keyboardEventKeyMotion = SDL.Released
+                                                                               }) =
   case SDL.keysymModifier keysym of
     SDL.KeyModifier { SDL.keyModifierLeftShift = False
                     , SDL.keyModifierRightShift = False

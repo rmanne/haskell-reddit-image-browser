@@ -47,6 +47,10 @@ dependencies:
 - unordered-containers
 - yaml
 - data-default
+- extra
+- JuicyPixels
+- JuicyPixels-extra
+- bytestring-to-vector
 
 default-extensions:
 - LambdaCase

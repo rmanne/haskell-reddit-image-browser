@@ -1,3 +1,5 @@
+{-# LANGUAGE TemplateHaskell #-}
+
 module View
   ( view
   ) where
@@ -5,12 +7,34 @@ module View
 import qualified Codec.FFmpeg as FFmpeg
 import qualified Codec.FFmpeg.Common as FFmpegCommon
 import qualified Codec.FFmpeg.Decode as FFmpeg
-import Control.Concurrent (threadDelay)
-import Control.Concurrent.Chan (Chan, writeChan)
-import Control.Monad (join)
+import Control.Concurrent
+  ( MVar
+  , forkOn
+  , newEmptyMVar
+  , putMVar
+  , takeMVar
+  , threadDelay
+  )
+import Control.Concurrent.Chan (Chan, newChan, readChan, writeChan)
+import Control.Lens
+  ( (%=)
+  , (%~)
+  , (&)
+  , (+=)
+  , (-=)
+  , (.=)
+  , (.~)
+  , (^.)
+  , _2
+  , makeLenses
+  , use
+  )
+import Control.Monad (forever, join)
 import Control.Monad.Except (runExceptT, when)
+import Control.Monad.Extra (unlessM, whileM)
 import Control.Monad.Trans.Class (lift)
 import qualified Control.Monad.Trans.State.Strict as State
+import Control.Monad.Trans.State.Strict (StateT)
 import Data.ByteString (ByteString)
 import Data.ByteString.Unsafe (unsafePackCStringFinalizer)
 import Data.Default (Default(def))
@@ -19,13 +43,16 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Time.Calendar (toGregorian)
 import Data.Time.Clock (utctDay)
-import EventHandler
+import qualified EventHandler
 import Foreign.C.Types (CInt)
 import Foreign.Ptr (castPtr)
 import qualified Reddit.Types.Listing as R
 import qualified Reddit.Types.Post as R
 import qualified SDL
 import Types
+import View.Render (newThread)
+import qualified View.Render
+import View.Types
 
 -- TODO: Audio
 -- https://hackage.haskell.org/package/sdl2-2.5.3.0/docs/SDL-Audio.html
@@ -35,26 +62,22 @@ import Types
 -- https://github.com/acowley/ffmpeg-light/compare/audio#diff-cbdc928a28fd3b49d906aab9cdb228bc31f3d3017fcbb6b411082f6a3feb6fa7
 -- TODO: Render text
 -- https://hackage.haskell.org/package/sdl2-ttf-2.1.1/docs/SDL-Font.html
-data ViewResources =
-  ViewResources
-    { modelChannel :: Chan Command
-    , window :: SDL.Window
-    , renderer :: SDL.Renderer
-    , renderingContextBuilder :: CInt -> CInt -> RenderingContext
-    , renderingContext :: RenderingContext
-    , nextFrame :: ViewIO ()
-    , currentFrame :: ViewIO ()
-    , cleanup :: IO ()
-    , windowWidth :: CInt
-    , windowHeight :: CInt
-    , quit :: Bool
+data State =
+  State
+    { _modelChannel :: Chan Command
+    , _window :: SDL.Window
+    , _renderer :: SDL.Renderer
+    , _windowWidth :: CInt
+    , _windowHeight :: CInt
+    , _renderChannel :: Maybe (Chan View.Render.Action, MVar ())
+    , _quit :: Bool
     }
 
-type ViewIO = State.StateT ViewResources IO
+$(makeLenses ''State)
 
 -- | This should be run in the main thread. This function will not return until the view is closed.
-view :: Chan Command -> IORef (Maybe View) -> IO ()
-view controllerChannel viewRef = do
+view :: Chan Command -> Chan Action -> IO ()
+view controllerChannel viewChannel = do
   FFmpeg.initFFmpeg
   SDL.initializeAll
   window <-
@@ -63,195 +86,73 @@ view controllerChannel viewRef = do
   SDL.rendererDrawColor renderer SDL.$= SDL.V4 0 0 0 255
   SDL.clear renderer
   let viewResources =
-        ViewResources
-          { modelChannel = controllerChannel
-          , window = window
-          , renderer = renderer
-          , renderingContextBuilder = \_ _ -> def
-          , renderingContext = def
-          , nextFrame = return ()
-          , currentFrame = return ()
-          , cleanup = return ()
-          , windowHeight = 100
-          , windowWidth = 100
-          , quit = False
+        State
+          { _modelChannel = controllerChannel
+          , _window = window
+          , _renderer = renderer
+          , _windowHeight = 100
+          , _windowWidth = 100
+          , _renderChannel = Nothing
+          , _quit = False
           }
-  viewResources' <- State.execStateT (viewLoop viewRef) viewResources
-  cleanup viewResources'
+  forkOn 0 (eventLoop controllerChannel viewChannel)
+  State.execStateT (viewLoop viewChannel) viewResources
   SDL.destroyRenderer renderer
   SDL.destroyWindow window
   SDL.quit
 
-viewToTitleFile :: View -> (String, Maybe FilePath)
-viewToTitleFile (Deleted (R.PostID post), _) =
-  ("[Deleted] " <> show post, Nothing)
-viewToTitleFile (Failed (R.PostID post), currentIndex) =
-  ("[Failed] " <> show post, Nothing)
-viewToTitleFile (Submitted post, currentIndex) =
-  ( "[Downloading] " <>
-    (let (_, month, day) = toGregorian $ utctDay (R.created post)
-      in show month <> "/" <> show day) <>
-    " [score=" <> show (R.score post) <> "] " <> Text.unpack (R.title post)
-  , Nothing)
-viewToTitleFile (Downloaded post files, currentIndex) =
-  let currentIndex' = currentIndex `mod` length files
-   in ( (let (_, month, day) = toGregorian $ utctDay (R.created post)
-          in show month <> "/" <> show day) <>
-        " [score=" <>
-        show (R.score post) <>
-        "] [" <>
-        show currentIndex' <>
-        "/" <>
-        show (length files) <>
-        "] [" <>
-        (let R.PostID postId = R.postID post
-          in Text.unpack postId) <>
-        "] " <> Text.unpack (R.title post)
-      , Just (files !! currentIndex'))
+eventLoop :: Chan Command -> Chan Action -> IO ()
+eventLoop modelChannel viewChannel =
+  whileM $
+  SDL.waitEvent >>= EventHandler.processEvent modelChannel >>= \case
+    Just EventHandler.Quit -> writeChan viewChannel Quit >> return False
+    Just (EventHandler.ResizeWindow width height) ->
+      writeChan viewChannel (Resize width height) >> return True
+    Nothing -> return True
 
-data RenderingContext =
-  RenderingContext
-    { destinationRectangle :: SDL.Rectangle CInt
-    }
-
-instance Default RenderingContext where
-  def = RenderingContext $ SDL.Rectangle (SDL.P (SDL.V2 0 0)) (SDL.V2 0 0)
-
-renderingGenerator ::
-     SDL.Renderer
-  -> FilePath
-  -> IO (CInt -> CInt -> RenderingContext, ViewIO (), ViewIO (), IO ())
-renderingGenerator renderer file = do
-  (reader, cleanup) <-
-    runExceptT (FFmpeg.frameReaderTime FFmpeg.avPixFmtRgb24 (FFmpeg.File file)) >>= \case
-      Right v -> return v
-      Left msg -> fail msg
-  (firstFrame, firstFrameTime) <-
-    reader >>= \case
-      Nothing -> fail "First frame is empty"
-      Just v -> return v
-  Just imageBufferSize <- FFmpegCommon.frameBufferSize firstFrame
-  Just imageLineSize <- FFmpegCommon.frameLineSize firstFrame
-  unsafeImageBuffer <- FFmpegCommon.av_malloc (fromIntegral imageBufferSize)
-  imageBuffer <-
-    unsafePackCStringFinalizer
-      (castPtr unsafeImageBuffer)
-      (fromIntegral imageBufferSize)
-      (FFmpegCommon.av_free unsafeImageBuffer)
-  let textureWidth = imageLineSize `div` 3 -- 3 because Rgb24 format
-      textureHeight = imageBufferSize `div` imageLineSize
-  texture <-
-    SDL.createTexture
-      renderer
-      SDL.RGB24
-      SDL.TextureAccessStreaming
-      (SDL.V2 textureWidth textureHeight)
-  startTime <- SDL.time
-  let currentFrame =
-        State.gets renderingContext >>= \RenderingContext {destinationRectangle} -> do
-          SDL.clear renderer
-          SDL.copy renderer texture Nothing (Just destinationRectangle)
-          SDL.present renderer
-      updateTexture frame = do
-        Just _ <-
-          FFmpegCommon.frameCopyToBuffer frame (castPtr unsafeImageBuffer)
-        _ <- SDL.updateTexture texture Nothing imageBuffer imageLineSize
-        return ()
-      nextFrame =
-        lift
-          (reader >>= \case
-             Nothing -> threadDelay 30000
-             Just (frame, time) -> do
-               currentTime <- SDL.time
-               when (currentTime < startTime + time) $
-                 threadDelay $
-                 floor $ (* 1000000) $ startTime + time - currentTime
-               updateTexture frame) >>
-        currentFrame
-      rectangleFor windowWidth windowHeight =
-        let scaleWidth :: Double
-            scaleWidth = fromIntegral textureWidth / fromIntegral windowWidth
-            scaleHeight :: Double
-            scaleHeight = fromIntegral textureHeight / fromIntegral windowHeight
-            scale :: Double
-            scale = max scaleWidth scaleHeight
-            (scaledWidth, scaledHeight) =
-              ( floor (fromIntegral textureWidth / scale)
-              , floor (fromIntegral textureHeight / scale))
-            (horizontalOffset, verticalOffset) =
-              if scaleWidth < scaleHeight
-                then (floor (fromIntegral (windowWidth - scaledWidth) / 2), 0)
-                else (0, floor (fromIntegral (windowHeight - scaledHeight) / 2))
-         in SDL.Rectangle
-              (SDL.P (SDL.V2 horizontalOffset verticalOffset))
-              (SDL.V2 scaledWidth scaledHeight)
-  updateTexture firstFrame
-  return
-    ( \width height -> RenderingContext (rectangleFor width height)
-    , nextFrame
-    , currentFrame
-    , SDL.destroyTexture texture >> cleanup)
-
-switchFile :: Maybe FilePath -> ViewIO ()
+switchFile :: Maybe FilePath -> StateT State IO ()
 switchFile Nothing = do
-  renderer <- State.gets renderer
+  renderer <- use renderer
   lift $ SDL.clear renderer
   lift $ SDL.present renderer
-  State.modify $ \viewResources ->
-    viewResources
-      { renderingContextBuilder = \_ _ -> def
-      , renderingContext = def
-      , nextFrame = return ()
-      , currentFrame = return ()
-      , cleanup = return ()
-      }
 switchFile (Just file) = do
-  renderer <- State.gets renderer
-  (renderingContextBuilder, nextFrame, currentFrame, cleanup) <-
-    lift $ renderingGenerator renderer file
-  renderingContext <-
-    renderingContextBuilder <$> State.gets windowWidth <*>
-    State.gets windowHeight
-  State.modify $ \viewResources ->
-    viewResources
-      { renderingContextBuilder = renderingContextBuilder
-      , renderingContext = renderingContext
-      , nextFrame = nextFrame
-      , currentFrame = currentFrame
-      , cleanup = cleanup
-      }
-  currentFrame
+  renderer <- use renderer
+  channel <- lift newChan
+  handle <- lift newEmptyMVar
+  renderChannel .= Just (channel, handle)
+  width <- use windowWidth
+  height <- use windowHeight
+  lift
+    (forkOn
+       0
+       (newThread renderer file width height channel >> putMVar handle ()))
+  return ()
 
-viewLoop :: IORef (Maybe View) -> ViewIO ()
-viewLoop viewRef =
-  SDL.mapEvents processEventT >> State.gets quit >>= \case
-    True -> return ()
-    False ->
-      lift (atomicModifyIORef viewRef (Nothing, )) >>= \case
-        Nothing -> join (State.gets nextFrame) >> viewLoop viewRef
-        Just view -> do
-          State.gets cleanup >>= lift
-          let (title, file) = viewToTitleFile view
-          lift $ print (title, file)
-          State.gets window >>= \window ->
-            SDL.windowTitle window SDL.$= Text.pack title
-          switchFile file
-          viewLoop viewRef
-  where
-    processEventT :: SDL.Event -> ViewIO ()
-    processEventT event =
-      State.gets modelChannel >>= \modelChannel ->
-        lift (processEvent modelChannel event) >>= \case
-          Just Quit ->
-            State.modify $ \viewResources -> viewResources {quit = True}
-          Just (ResizeWindow width height) ->
-            State.gets renderingContextBuilder >>= \builder ->
-              State.modify
-                (\viewResources ->
-                   viewResources
-                     { windowWidth = width
-                     , windowHeight = height
-                     , renderingContext = builder width height
-                     }) >>
-              join (State.gets currentFrame)
-          Nothing -> return ()
+endRenderingThread :: StateT State IO ()
+endRenderingThread =
+  use renderChannel >>= \case
+    Nothing -> return ()
+    Just (channel, mvar) ->
+      lift (writeChan channel View.Render.Stop) >> lift (takeMVar mvar) >>
+      renderChannel .= Nothing
+
+viewLoop :: Chan Action -> StateT State IO ()
+viewLoop actionChannel =
+  whileM $
+  lift (readChan actionChannel) >>= \case
+    Quit -> do
+      endRenderingThread
+      return False
+    Resize width height ->
+      use renderChannel >>= \case
+        Nothing -> return True
+        Just (channel, _) ->
+          lift (writeChan channel (View.Render.Resize width height)) >>
+          windowWidth .= width >>
+          windowHeight .= height >>
+          return True
+    Update title file -> do
+      endRenderingThread
+      use window >>= \window -> SDL.windowTitle window SDL.$= Text.pack title
+      switchFile file
+      return True
