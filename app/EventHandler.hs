@@ -4,10 +4,9 @@ module EventHandler
   ) where
 
 import Control.Concurrent.Chan (Chan, writeChan)
-import Data.IORef (IORef, atomicModifyIORef, writeIORef)
 import Foreign.C.Types (CInt)
 import qualified SDL
-import Types
+import Types (Command(Next, Prev, Toggle, Remove, Save, ToggleDeleted, Refresh, Front, Back, Commit, FindFailed, Status, NextImage, PrevImage, Multi))
 
 data ViewAction
   = ResizeWindow CInt CInt
@@ -77,5 +76,6 @@ processEventPayload controllerChannel (SDL.KeyboardEvent SDL.KeyboardEventData {
         _ -> return Nothing
     _ -> return Nothing
   where
+    send :: Command -> IO (Maybe ViewAction)
     send command = writeChan controllerChannel command >> return Nothing
 processEventPayload _ _ = return Nothing

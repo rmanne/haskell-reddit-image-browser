@@ -73,5 +73,20 @@ executables:
     - -with-rtsopts=-N
     - -O2
     - -main-is Main
+    - -Wall
+    - -Wincomplete-uni-patterns
+    - -Wincomplete-record-updates
+    - -Wpartial-fields
+    - -Wmissing-home-modules
+    - -Widentities
+    - -Wredundant-constraints
+    - -Wcpp-undef
+    - -Wmissing-export-lists
+    - -Wmissing-import-lists
+    - -Wmonomorphism-restriction
+    - -Wmissing-local-signatures
+    - -Wmissed-specialisations
+    - -Werror
+    # https://medium.com/mercury-bank/enable-all-the-warnings-a0517bc081c3
     dependencies:
     - hs-reddit-image-browser

@@ -1,12 +1,12 @@
-module Main where
+module Main
+  ( main
+  ) where
 
-import View(view)
+import Control.Concurrent (forkIO)
+import Control.Concurrent.Chan (newChan)
 import Model (model)
 import System.Environment (getArgs)
-import Types
-import Data.IORef (IORef, atomicModifyIORef, newIORef)
-import Control.Concurrent(forkIO)
-import Control.Concurrent.Chan(newChan)
+import View (view)
 
 main :: IO ()
 main = do

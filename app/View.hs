@@ -5,54 +5,21 @@ module View
   ) where
 
 import qualified Codec.FFmpeg as FFmpeg
-import qualified Codec.FFmpeg.Common as FFmpegCommon
-import qualified Codec.FFmpeg.Decode as FFmpeg
-import Control.Concurrent
-  ( MVar
-  , forkOn
-  , newEmptyMVar
-  , putMVar
-  , takeMVar
-  , threadDelay
-  )
+import Control.Concurrent (MVar, forkOn, newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.Chan (Chan, newChan, readChan, writeChan)
-import Control.Lens
-  ( (%=)
-  , (%~)
-  , (&)
-  , (+=)
-  , (-=)
-  , (.=)
-  , (.~)
-  , (^.)
-  , _2
-  , makeLenses
-  , use
-  )
-import Control.Monad (forever, join)
-import Control.Monad.Except (runExceptT, when)
-import Control.Monad.Extra (unlessM, whileM)
+import Control.Lens ((.=), makeLenses, use, uses)
+import Control.Monad.Extra (whileM)
 import Control.Monad.Trans.Class (lift)
 import qualified Control.Monad.Trans.State.Strict as State
 import Control.Monad.Trans.State.Strict (StateT)
-import Data.ByteString (ByteString)
-import Data.ByteString.Unsafe (unsafePackCStringFinalizer)
-import Data.Default (Default(def))
-import Data.IORef (IORef, atomicModifyIORef, newIORef)
-import Data.Text (Text)
 import qualified Data.Text as Text
-import Data.Time.Calendar (toGregorian)
-import Data.Time.Clock (utctDay)
 import qualified EventHandler
 import Foreign.C.Types (CInt)
-import Foreign.Ptr (castPtr)
-import qualified Reddit.Types.Listing as R
-import qualified Reddit.Types.Post as R
 import qualified SDL
-import Types
+import Types (Command)
 import View.Render (newThread)
 import qualified View.Render
-import View.Types
+import View.Types (Action(Quit, Resize, Update))
 
 -- TODO: Audio
 -- https://hackage.haskell.org/package/sdl2-2.5.3.0/docs/SDL-Audio.html
@@ -64,13 +31,11 @@ import View.Types
 -- https://hackage.haskell.org/package/sdl2-ttf-2.1.1/docs/SDL-Font.html
 data State =
   State
-    { _modelChannel :: Chan Command
-    , _window :: SDL.Window
+    { _window :: SDL.Window
     , _renderer :: SDL.Renderer
     , _windowWidth :: CInt
     , _windowHeight :: CInt
     , _renderChannel :: Maybe (Chan View.Render.Action, MVar ())
-    , _quit :: Bool
     }
 
 $(makeLenses ''State)
@@ -80,25 +45,23 @@ view :: Chan Command -> Chan Action -> IO ()
 view controllerChannel viewChannel = do
   FFmpeg.initFFmpeg
   SDL.initializeAll
-  window <-
+  w <-
     SDL.createWindow "Loading..." SDL.defaultWindow {SDL.windowResizable = True}
-  renderer <- SDL.createRenderer window (-1) SDL.defaultRenderer
-  SDL.rendererDrawColor renderer SDL.$= SDL.V4 0 0 0 255
-  SDL.clear renderer
+  r <- SDL.createRenderer w (-1) SDL.defaultRenderer
+  SDL.rendererDrawColor r SDL.$= SDL.V4 0 0 0 255
+  SDL.clear r
   let viewResources =
         State
-          { _modelChannel = controllerChannel
-          , _window = window
-          , _renderer = renderer
+          { _window = w
+          , _renderer = r
           , _windowHeight = 100
           , _windowWidth = 100
           , _renderChannel = Nothing
-          , _quit = False
           }
-  forkOn 0 (eventLoop controllerChannel viewChannel)
-  State.execStateT (viewLoop viewChannel) viewResources
-  SDL.destroyRenderer renderer
-  SDL.destroyWindow window
+  _ <- forkOn 0 (eventLoop controllerChannel viewChannel)
+  _ <- State.execStateT (viewLoop viewChannel) viewResources
+  SDL.destroyRenderer r
+  SDL.destroyWindow w
   SDL.quit
 
 eventLoop :: Chan Command -> Chan Action -> IO ()
@@ -111,21 +74,17 @@ eventLoop modelChannel viewChannel =
     Nothing -> return True
 
 switchFile :: Maybe FilePath -> StateT State IO ()
-switchFile Nothing = do
-  renderer <- use renderer
-  lift $ SDL.clear renderer
-  lift $ SDL.present renderer
+switchFile Nothing =
+  use renderer >>= \r -> lift (SDL.clear r) >> lift (SDL.present r)
 switchFile (Just file) = do
-  renderer <- use renderer
+  r <- use renderer
   channel <- lift newChan
   handle <- lift newEmptyMVar
   renderChannel .= Just (channel, handle)
   width <- use windowWidth
   height <- use windowHeight
-  lift
-    (forkOn
-       0
-       (newThread renderer file width height channel >> putMVar handle ()))
+  _ <-
+    lift (forkOn 0 (newThread r file width height channel >> putMVar handle ()))
   return ()
 
 endRenderingThread :: StateT State IO ()
@@ -153,6 +112,7 @@ viewLoop actionChannel =
           return True
     Update title file -> do
       endRenderingThread
-      use window >>= \window -> SDL.windowTitle window SDL.$= Text.pack title
+      uses window SDL.windowTitle >>= \titleVar ->
+        titleVar SDL.$= Text.pack title
       switchFile file
       return True

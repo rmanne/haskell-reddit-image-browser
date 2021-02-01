@@ -1,7 +1,10 @@
-module OldPointedList where
+module OldPointedList
+  ( PointedList(..)
+  , conv
+  ) where
 
+import Control.Lens ((&), (.~))
 import qualified Data.PointedList as PL
-import Control.Lens((&), (.~))
 
 data PointedList a =
   PointedList
@@ -13,9 +16,5 @@ data PointedList a =
 
 conv :: PointedList a -> PL.PointedList a
 conv PointedList {..} =
-  let
-    pl = PL.fromList [current]
-  in
-    pl & PL.current .~ current
-       & PL.front .~ front
-       & PL.back .~ back
+  let pl = PL.fromList [current]
+   in pl & PL.current .~ current & PL.front .~ front & PL.back .~ back

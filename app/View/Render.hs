@@ -8,42 +8,22 @@ module View.Render
   ) where
 
 import qualified Codec.FFmpeg as FFmpeg
-import qualified Codec.FFmpeg.Decode as FFmpeg
 import qualified Codec.Picture.Types as Pic
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.Chan (Chan, readChan, writeChan)
-import Control.Lens
-  ( (%=)
-  , (%~)
-  , (&)
-  , (+=)
-  , (-=)
-  , (.=)
-  , (.~)
-  , (^.)
-  , _2
-  , makeLenses
-  , use
-  )
+import Control.Lens ((.=), makeLenses, use)
 import Control.Monad.Except (when)
 import Control.Monad.Extra (whileM)
-import Control.Monad.ST (RealWorld)
 import Control.Monad.Trans.Class (lift)
 import qualified Control.Monad.Trans.State.Strict as State
 import Control.Monad.Trans.State.Strict (StateT)
-import qualified Data.Vector.Storable as Vector
 import Data.Vector.Storable.ByteString (vectorToByteString)
-import qualified Data.Vector.Storable.Mutable as Vector
 import Foreign.C.Types (CInt)
 import qualified SDL
-import qualified SDL.Video.Renderer as SDL
 
 data Action
   = Stop
-  | Resize
-      { windowWidth :: CInt
-      , windowHeight :: CInt
-      }
+  | Resize CInt CInt
   | Next
   | Render
 
@@ -62,22 +42,23 @@ rectangleFor :: Pic.Image Pixel -> CInt -> CInt -> SDL.Rectangle CInt
 rectangleFor Pic.Image { Pic.imageWidth = imageWidth
                        , Pic.imageHeight = imageHeight
                        } windowWidth windowHeight =
-  let scaleWidth :: Double
-      scaleWidth = fromIntegral imageWidth / fromIntegral windowWidth
-      scaleHeight :: Double
-      scaleHeight = fromIntegral imageHeight / fromIntegral windowHeight
-      scale :: Double
-      scale = max scaleWidth scaleHeight
-      (scaledWidth, scaledHeight) =
-        ( floor (fromIntegral imageWidth / scale)
-        , floor (fromIntegral imageHeight / scale))
-      (horizontalOffset, verticalOffset) =
-        if scaleWidth < scaleHeight
-          then (floor (fromIntegral (windowWidth - scaledWidth) / 2), 0)
-          else (0, floor (fromIntegral (windowHeight - scaledHeight) / 2))
-   in SDL.Rectangle
-        (SDL.P (SDL.V2 horizontalOffset verticalOffset))
-        (SDL.V2 scaledWidth scaledHeight)
+  let maxScale :: Double
+      maxScale =
+        max
+          (fromIntegral imageWidth / fromIntegral windowWidth)
+          (fromIntegral imageHeight / fromIntegral windowHeight)
+      dimensions :: SDL.V2 CInt
+      dimensions =
+        SDL.V2
+          (floor (fromIntegral imageWidth / maxScale))
+          (floor (fromIntegral imageHeight / maxScale))
+      toDouble :: CInt -> Double
+      toDouble = fromIntegral
+      offset :: SDL.V2 CInt
+      offset =
+        floor . (/ 2) . toDouble <$>
+        (SDL.V2 windowWidth windowHeight - dimensions)
+   in SDL.Rectangle (SDL.P offset) dimensions
 
 -- TODO: scaling with something like bilinear scaling per-image is hella slow
 -- look into libswscale (ffmpeg) and generally heavier bindings to ffmpeg
@@ -86,43 +67,43 @@ rectangleFor Pic.Image { Pic.imageWidth = imageWidth
 -- https://trac.ffmpeg.org/wiki/Using%20libav*
 scale :: StateT State IO ()
 scale =
-  use texture >>= \texture ->
-    use frame >>= \frame ->
+  use texture >>= \t ->
+    use frame >>= \f ->
       SDL.updateTexture
-        texture
+        t
         Nothing
-        (vectorToByteString (Pic.imageData frame))
-        (fromIntegral $ Pic.imageWidth frame * 3) >>
+        (vectorToByteString (Pic.imageData f))
+        (fromIntegral $ Pic.imageWidth f * 3) >>
       return ()
 
 allocate :: SDL.Renderer -> CInt -> CInt -> Pic.Image Pixel -> IO State
-allocate renderer windowWidth windowHeight frame = do
-  let rectangle@(SDL.Rectangle _ (SDL.V2 scaledWidth scaledHeight)) =
-        rectangleFor frame windowWidth windowHeight
-  texture <-
-    SDL.createTexture
-      renderer
-      SDL.RGB24
-      SDL.TextureAccessStreaming
-      (SDL.V2
-         (fromIntegral $ Pic.imageWidth frame)
-         (fromIntegral $ Pic.imageHeight frame))
-  return State {_rectangle = rectangle, _texture = texture, _frame = frame}
+allocate renderer windowWidth windowHeight f =
+  State (rectangleFor f windowWidth windowHeight) <$>
+  SDL.createTexture
+    renderer
+    SDL.RGB24
+    SDL.TextureAccessStreaming
+    (SDL.V2 (fromIntegral $ Pic.imageWidth f) (fromIntegral $ Pic.imageHeight f)) <*>
+  pure f
 
 newThread :: SDL.Renderer -> FilePath -> CInt -> CInt -> Chan Action -> IO ()
 newThread renderer file originalWindowWidth originalWindowHeight channel = do
   (reader, cleanup) <- FFmpeg.imageReaderTime (FFmpeg.File file)
   initialState <-
-    reader >>= \(Just (frame, _)) ->
-      allocate renderer originalWindowWidth originalWindowHeight frame
+    reader >>= \case
+      Just (firstFrame, _) ->
+        allocate renderer originalWindowWidth originalWindowHeight firstFrame
+      Nothing -> fail "Could not find first frame"
   startTime <- SDL.time
   writeChan channel Render
   State.evalStateT
     (do scale
         whileM $
           lift (readChan channel) >>= \case
-            Stop -> use texture >>= lift . SDL.destroyTexture >> return False
-            Resize {..} -> do
+            Stop ->
+              lift cleanup >> use texture >>= lift . SDL.destroyTexture >>
+              return False
+            Resize windowWidth windowHeight -> do
               use texture >>= lift . SDL.destroyTexture
               newState <-
                 use frame >>= lift . allocate renderer windowWidth windowHeight
@@ -134,8 +115,7 @@ newThread renderer file originalWindowWidth originalWindowHeight channel = do
               lift reader >>= \case
                 Nothing -> return True
                 Just (frame', time) ->
-                  frame .= frame' >>
-                  scale >> lift SDL.time >>= \currentTime ->
+                  frame .= frame' >> scale >> lift SDL.time >>= \currentTime ->
                     lift
                       (forkIO
                          (when
@@ -152,6 +132,5 @@ newThread renderer file originalWindowWidth originalWindowHeight channel = do
 
 updateRenderer :: SDL.Renderer -> StateT State IO ()
 updateRenderer renderer =
-  SDL.clear renderer >> use texture >>= \texture ->
-    use rectangle >>= SDL.copy renderer texture Nothing . Just >>
-    SDL.present renderer
+  SDL.clear renderer >> use texture >>= \t ->
+    use rectangle >>= SDL.copy renderer t Nothing . Just >> SDL.present renderer

@@ -1,4 +1,6 @@
-module View.Types where
+module View.Types
+  ( Action(..)
+  ) where
 
 import Foreign.C.Types (CInt)
 
