@@ -59,6 +59,7 @@ default-extensions:
 - MultiWayIf
 - NamedFieldPuns
 - RecordWildCards
+- FlexibleContexts
 
 library:
   source-dirs: src

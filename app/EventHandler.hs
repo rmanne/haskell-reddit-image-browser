@@ -1,27 +1,28 @@
 module EventHandler
-  ( ViewAction(..)
-  , processEvent
+  ( processEvent
   ) where
 
 import Control.Concurrent.Chan (Chan, writeChan)
-import Foreign.C.Types (CInt)
 import qualified SDL
-import Types (Command(Next, Prev, Toggle, Remove, Save, ToggleDeleted, Refresh, Front, Back, Commit, FindFailed, Status, NextImage, PrevImage, Multi))
+import Types
+  ( Command(Back, Commit, FindFailed, Front, Multi, Next, NextImage,
+        Prev, PrevImage, Refresh, Remove, Save, Status, Toggle,
+        ToggleDeleted)
+  )
+import qualified Types as Model
+import View.Types (Action(Quit, Resize))
 
-data ViewAction
-  = ResizeWindow CInt CInt
-  | Quit
-
-processEvent :: Chan Command -> SDL.Event -> IO (Maybe ViewAction)
+processEvent :: Chan Command -> SDL.Event -> IO (Maybe Action)
 processEvent chan event = processEventPayload chan (SDL.eventPayload event)
 
-processEventPayload :: Chan Command -> SDL.EventPayload -> IO (Maybe ViewAction)
-processEventPayload _ (SDL.WindowSizeChangedEvent SDL.WindowSizeChangedEventData {SDL.windowSizeChangedEventSize = SDL.V2 width height}) =
-  return $ Just $ ResizeWindow (fromIntegral width) (fromIntegral height)
-processEventPayload _ SDL.QuitEvent = return $ Just Quit
-processEventPayload controllerChannel (SDL.KeyboardEvent SDL.KeyboardEventData { SDL.keyboardEventKeysym = keysym
-                                                                               , SDL.keyboardEventKeyMotion = SDL.Released
-                                                                               }) =
+processEventPayload :: Chan Command -> SDL.EventPayload -> IO (Maybe Action)
+processEventPayload _ (SDL.WindowSizeChangedEvent SDL.WindowSizeChangedEventData {SDL.windowSizeChangedEventSize = newSize}) =
+  return $ Just $ Resize $ fromIntegral <$> newSize
+processEventPayload modelChannel SDL.QuitEvent =
+  writeChan modelChannel Model.Quit >> return (Just Quit)
+processEventPayload modelChannel (SDL.KeyboardEvent SDL.KeyboardEventData { SDL.keyboardEventKeysym = keysym
+                                                                          , SDL.keyboardEventKeyMotion = SDL.Released
+                                                                          }) =
   case SDL.keysymModifier keysym of
     SDL.KeyModifier { SDL.keyModifierLeftShift = False
                     , SDL.keyModifierRightShift = False
@@ -36,7 +37,7 @@ processEventPayload controllerChannel (SDL.KeyboardEvent SDL.KeyboardEventData {
                     , SDL.keyModifierAltGr = False
                     } ->
       case SDL.keysymKeycode keysym of
-        SDL.KeycodeQ -> return $ Just Quit
+        SDL.KeycodeQ -> writeChan modelChannel Model.Quit >> return (Just Quit)
         SDL.KeycodeJ -> send Next
         SDL.KeycodeK -> send Prev
         SDL.KeycodeS -> send Toggle
@@ -76,6 +77,6 @@ processEventPayload controllerChannel (SDL.KeyboardEvent SDL.KeyboardEventData {
         _ -> return Nothing
     _ -> return Nothing
   where
-    send :: Command -> IO (Maybe ViewAction)
-    send command = writeChan controllerChannel command >> return Nothing
+    send :: Command -> IO (Maybe Action)
+    send command = writeChan modelChannel command >> return Nothing
 processEventPayload _ _ = return Nothing

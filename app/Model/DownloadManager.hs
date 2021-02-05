@@ -4,7 +4,7 @@ module Model.DownloadManager
 
 import Control.Concurrent (forkIO)
 import Control.Concurrent.Chan (Chan, getChanContents, newChan, writeChan)
-import Control.Monad (forM_, mapM_, replicateM_)
+import Control.Monad (forM_, replicateM_)
 import qualified Data.Text as Text
 import Data.Text (Text)
 import ImageLink (imageLinks)

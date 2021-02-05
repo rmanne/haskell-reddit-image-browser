@@ -3,8 +3,9 @@ module View.Types
   ) where
 
 import Foreign.C.Types (CInt)
+import SDL (V2)
 
 data Action
   = Quit
-  | Resize CInt CInt
+  | Resize (V2 CInt)
   | Update String (Maybe FilePath)
