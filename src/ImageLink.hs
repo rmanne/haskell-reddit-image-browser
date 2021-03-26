@@ -61,7 +61,8 @@ instance FromJSON RedditGallery where
                        return
                          ["https://i.redd.it/" ++ Text.unpack mediaId ++ ".gif"]
                      _ -> return [])
-              (HashMap.toList mediaMetadata) >>= \urls -> return (RedditGallery (concat urls))
+              (HashMap.toList mediaMetadata) >>= \urls ->
+              return (RedditGallery (concat urls))
   parseJSON v = typeMismatch "Response should be an aeson object" v
 
 trim :: String -> String
@@ -183,28 +184,32 @@ imgurOtherHandler link =
     [_] -> do
       putStrLn "Found other imgur link"
       let link' =
+            case link =~ ("(.*)\\?[^?]*" :: String) :: [[String]] of
+              [[_, baseUrl]] -> baseUrl
+              _ -> link
+      let imageLink1 =
             trim <$>
             readCreateProcess
               (shell $
                "curl -L -s '" ++
-               link ++
+               link' ++
                "' | sed -n 's/.*contentURL.*content=\"\\(.*\\)\".*/\\1/p'")
               ""
-      let link'' =
+      let imageLink2 =
             trim <$>
             readCreateProcess
               (shell $
                "curl -L -s '" ++
-               link ++ "' | sed -n 's/.*image_src.*href=\"\\(.*\\)\".*/\\1/p'")
+               link' ++ "' | sed -n 's/.*image_src.*href=\"\\(.*\\)\".*/\\1/p'")
               ""
-      let link''' =
+      let imageLink3 =
             trim <$>
             readCreateProcess
               (shell $
                "curl -L -s '" ++
-               link ++ "' | grep -wo 'https://i.imgur[^\"]*' | grep -v '?'")
+               link' ++ "' | grep -wo 'https://i.imgur[^\"]*' | grep -v '?'")
               ""
-      link' <|> link'' <|> link''' >>= return . (: [])
+      (: []) <$> (imageLink1 <|> imageLink2 <|> imageLink3)
     _ -> return []
   where
     (<|>) :: IO String -> IO String -> IO String
@@ -228,7 +233,7 @@ redgifHandler link =
   where
     fallback :: String -> HttpException -> IO [String]
     fallback gfycatId _ =
-      (\newId -> ["https://thumbs1.redgifs.com/" <> newId <> ".webm"]) <$> trim <$>
+      (\newId -> ["https://thumbs1.redgifs.com/" <> newId <> ".webm"]) . trim <$>
       readCreateProcess
         (shell $
          "curl -L -s '" <>

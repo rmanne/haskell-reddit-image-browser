@@ -6,7 +6,7 @@ import Control.Concurrent.Chan (Chan, writeChan)
 import qualified SDL
 import Types
   ( Command(Back, Commit, FindFailed, Front, Multi, Next, NextImage,
-        Prev, PrevImage, Refresh, Remove, Save, Status, Toggle,
+        Open, Prev, PrevImage, Refresh, Remove, Save, Status, Toggle,
         ToggleDeleted)
   )
 import qualified Types as Model
@@ -61,6 +61,7 @@ processEventPayload modelChannel (SDL.KeyboardEvent SDL.KeyboardEventData { SDL.
         SDL.Keycode7 -> send (Multi 7)
         SDL.Keycode8 -> send (Multi 8)
         SDL.Keycode9 -> send (Multi 9)
+        SDL.KeycodeO -> send Open
         _ -> return Nothing
     SDL.KeyModifier { SDL.keyModifierLeftCtrl = False
                     , SDL.keyModifierRightCtrl = False

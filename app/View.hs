@@ -19,6 +19,7 @@ import Types (Command)
 import View.Render (newThread)
 import qualified View.Render
 import View.Types (Action(Quit, Resize, Update))
+import Control.Exception (finally)
 
 -- TODO: Audio
 -- https://hackage.haskell.org/package/sdl2-2.5.3.0/docs/SDL-Audio.html
@@ -83,7 +84,7 @@ switchFile (Just file) = do
   renderChannel .= Just (channel, handle)
   dimensions <- use windowDimensions
   _ <-
-    liftIO (forkOn 0 (newThread r file dimensions channel >> putMVar handle ()))
+    liftIO (forkOn 0 (newThread r file dimensions channel `finally` putMVar handle ()))
   return ()
 
 endRenderingThread :: (MonadState State m, MonadIO m) => m ()

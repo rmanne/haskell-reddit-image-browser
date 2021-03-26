@@ -83,7 +83,7 @@ downloadPost config channel aria2InputChan p@R.Post { R.content = R.Link txt
               aria2InputChan
               ((R.postID p, i, length dl, fname), Text.pack dl')
     _ -> do
-      putStrLn $ "Unable to download " ++ link ++ " " ++ show dl
+      putStrLn $ "Unable to download " ++ link ++ " " ++ show dl ++ " sub=" ++ (let R.R subr = R.subreddit p in show subr)
       writeChan channel (Download (R.postID p) 1 1 [])
 downloadPost _ channel _ R.Post {R.postID = i} =
   writeChan channel (Download i 1 1 [])

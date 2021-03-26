@@ -21,6 +21,10 @@
 resolver: lts-17.1
 allow-newer: true
 
+nix:
+  enable: true
+  packages: [pcre, zlib, ffmpeg, pkg-config, SDL2]
+
 # User packages to be built.
 # Various formats can be used as shown in the example below.
 #

@@ -7,10 +7,10 @@ module Model
 
 import Control.Concurrent (ThreadId, forkIO, killThread, threadDelay)
 import Control.Concurrent.Chan (Chan, readChan, writeChan, writeList2Chan)
-import Control.Exception (Exception, SomeException(SomeException), catch)
+import Control.Exception (SomeException(SomeException), catch)
 import Control.Lens ((%=), (+=), (-=), (.=), (.~), (^.), makeLenses, use, uses)
 import Control.Lens.Setter ((<~))
-import Control.Monad (forever, join, replicateM_, when)
+import Control.Monad (forever, join, replicateM_, void, when)
 import Control.Monad.Except (MonadError, throwError)
 import Control.Monad.Extra (whenM, whileM)
 import Control.Monad.IO.Class (MonadIO, liftIO)
@@ -45,10 +45,11 @@ import Model.Types (Config)
 import qualified Reddit as R
 import qualified Reddit.Types.Post as R
 import System.Directory (XdgDirectory(XdgConfig), getXdgDirectory, removeFile)
+import System.Process (spawnCommand)
 import Types
   ( Command(Back, Commit, Download, FindFailed, Front, Multi, Next,
-        NextImage, Prev, PrevImage, Quit, Refresh, Remove, Save, Status,
-        Toggle, ToggleDeleted)
+        NextImage, Open, Prev, PrevImage, Quit, Refresh, Remove, Save,
+        Status, Toggle, ToggleDeleted)
   , Post(Deleted, Downloaded, Failed, Submitted)
   )
 import qualified View.Types as View
@@ -63,17 +64,17 @@ data Model =
   Model
     { _skipDeleted :: Bool
     , _posts :: PointedList Post
-    , _subredditName :: Text
     , _downloaded :: Map R.PostID [FilePath]
     , _downloadedMulti :: Map (R.PostID, Int) FilePath
-    , _downloadChannel :: Chan R.Post
     , _slideshowThread :: Maybe ThreadId
     , _multi :: Maybe Int
     , _currentIndex :: Int
+    , _subredditName :: Text
+    , _downloadChannel :: Chan R.Post
+    , _previousView :: (R.PostID, Int)
     , _config :: Config
     , _viewChannel :: Chan View.Action
     , _modelChannel :: Chan Command
-    , _previousView :: (R.PostID, Int)
     }
 
 $(makeLenses ''Model)
@@ -212,10 +213,10 @@ commitCurrent =
         (Nothing, _) -> return False
         (Just [], newMap) ->
           posts %= (current .~ Failed (R.postID post)) >> downloaded .= newMap >>
-          return False
+          return True
         (Just files, newMap) ->
           posts %= (current .~ Downloaded post files) >> downloaded .= newMap >>
-          return False
+          return True
     _ -> return False
 
 model :: String -> Chan Command -> Chan View.Action -> IO ()
@@ -253,9 +254,7 @@ model subr channel viewChan = do
     initialState
 
 basicUserActionHandler ::
-     (MonadError ActionHandlerException m, MonadState Model m, MonadIO m)
-  => Command
-  -> m ()
+     (MonadError () m, MonadState Model m, MonadIO m) => Command -> m ()
 basicUserActionHandler Next = next
 basicUserActionHandler Prev = prev
 basicUserActionHandler Toggle =
@@ -299,27 +298,22 @@ basicUserActionHandler Status =
 basicUserActionHandler NextImage = currentIndex += 1
 basicUserActionHandler PrevImage = currentIndex -= 1
 basicUserActionHandler (Multi n) = multi .= Just n
-basicUserActionHandler _ = throwError DidNotHandleException
+basicUserActionHandler Open =
+  uses posts (^. current) >>= \post ->
+    void
+      (liftIO
+         (spawnCommand
+            ("xdg-open https://reddit.com/" <> unpostID (postIdOf post))))
+  where
+    unpostID (R.PostID p) = Text.unpack p
+basicUserActionHandler _ = throwError ()
 
 multiUserActionHandler ::
-     (MonadError ActionHandlerException m, MonadState Model m, MonadIO m)
-  => Int
-  -> Command
-  -> m ()
+     (MonadError () m, MonadState Model m, MonadIO m) => Int -> Command -> m ()
 multiUserActionHandler n Next = replicateM_ n next
 multiUserActionHandler n Prev = replicateM_ n prev
 multiUserActionHandler n (Multi digit) = multi .= Just (n * 10 + digit)
-multiUserActionHandler _ _ = throwError DidNotHandleException
-
-data ActionHandlerException =
-  DidNotHandleException
-  deriving (Show)
-
-data QuittingException =
-  QuittingException
-  deriving (Show)
-
-instance Exception QuittingException
+multiUserActionHandler _ _ = throwError ()
 
 actionHandler ::
      (MonadError () m, MonadState Model m, MonadIO m) => Command -> m ()
@@ -336,12 +330,11 @@ actionHandler action =
   use multi >>= \case
     Nothing ->
       runExceptT (basicUserActionHandler action) >>= \case
-        Left DidNotHandleException ->
-          liftIO (putStrLn ("Unexpected action: " <> show action))
+        Left () -> liftIO (putStrLn ("Unexpected action: " <> show action))
         Right () -> checkAndDisplay
     Just n ->
       multi .= Nothing >> runExceptT (multiUserActionHandler n action) >>= \case
-        Left DidNotHandleException ->
+        Left () ->
           liftIO
             (putStrLn
                ("Unexpected combination of actions: " <>

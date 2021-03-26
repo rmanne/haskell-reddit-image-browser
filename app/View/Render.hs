@@ -9,7 +9,7 @@ import qualified Codec.FFmpeg as FFmpeg
 import qualified Codec.Picture.Types as Pic
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.Chan (Chan, readChan, writeChan)
-import Control.Lens ((.=), _1, _2, _3, _4, makeLenses, use, view)
+import Control.Lens ((.=), makeLenses, use, view)
 import Control.Monad (void, when)
 import Control.Monad.Extra (whileM)
 import Control.Monad.IO.Class (MonadIO, liftIO)
@@ -38,6 +38,16 @@ data State =
 
 $(makeLenses ''State)
 
+data Environment =
+  Environment
+    { _renderer :: SDL.Renderer
+    , _channel :: Chan Action
+    , _reader :: IO (Maybe (Pic.Image Pixel, Double))
+    , _startTime :: Double
+    }
+
+$(makeLenses ''Environment)
+
 imageDimensionsFor :: Num b => Pic.Image a -> SDL.V2 b
 imageDimensionsFor Pic.Image {..} =
   fromIntegral <$> SDL.V2 imageWidth imageHeight
@@ -54,8 +64,9 @@ rectangleFor image windowDimensions =
         (SDL.P ((`div` 2) <$> (windowDimensions - dimensions)))
         dimensions
 
-updateTexture :: (MonadState State m, MonadIO m) => SDL.Renderer -> m ()
-updateTexture renderer =
+updateTexture ::
+     (MonadState State m, MonadReader Environment m, MonadIO m) => m ()
+updateTexture =
   use texture >>= \t ->
     use frame >>= \f ->
       SDL.updateTexture
@@ -63,49 +74,48 @@ updateTexture renderer =
         Nothing
         (vectorToByteString (Pic.imageData f))
         (fromIntegral $ Pic.imageWidth f * 3) >>
-      SDL.clear renderer >>
-      use rectangle >>=
-      SDL.copy renderer t Nothing . Just >>
-      return ()
+      view renderer >>= \r ->
+        SDL.clear r >> use rectangle >>= SDL.copy r t Nothing . Just >>
+        return ()
 
 allocate ::
-     MonadIO m => SDL.Renderer -> SDL.V2 CInt -> Pic.Image Pixel -> m State
-allocate renderer windowDimensions f =
-  State (rectangleFor f windowDimensions) <$>
-  SDL.createTexture
-    renderer
-    SDL.RGB24
-    SDL.TextureAccessStreaming
-    (imageDimensionsFor f) <*>
-  pure f
+     (MonadReader Environment m, MonadIO m)
+  => SDL.V2 CInt
+  -> Pic.Image Pixel
+  -> m State
+allocate windowDimensions f =
+  view renderer >>= \r ->
+    State (rectangleFor f windowDimensions) <$>
+    SDL.createTexture
+      r
+      SDL.RGB24
+      SDL.TextureAccessStreaming
+      (imageDimensionsFor f) <*>
+    pure f
 
 newThread :: SDL.Renderer -> FilePath -> SDL.V2 CInt -> Chan Action -> IO ()
-newThread renderer file originalWindowDimensions channel = do
-  (reader, cleanup) <- FFmpeg.imageReaderTime (FFmpeg.File file)
-  initialState <-
-    reader >>= \case
-      Just (firstFrame, _) ->
-        allocate renderer originalWindowDimensions firstFrame
-      Nothing -> fail "Could not find first frame"
-  startTime <- SDL.time
-  writeChan channel Render
-  evalStateT
-    (do updateTexture renderer
-        whileM $
-          liftIO (readChan channel) >>= \action ->
-            getAll <$>
-            execWriterT
-              (runReaderT
-                 (onAction action)
-                 (renderer, reader, startTime, channel)))
-    initialState
+newThread renderer' file originalWindowDimensions channel' = do
+  (reader', cleanup) <- FFmpeg.imageReaderTime (FFmpeg.File file)
+  writeChan channel' Render
+  reader' >>= \case
+    Just (firstFrame, _) ->
+      (Environment renderer' channel' reader' <$> SDL.time) >>=
+      runReaderT
+        (allocate originalWindowDimensions firstFrame >>=
+         evalStateT actionProcessor)
+    Nothing -> cleanup >> fail "Could not find first frame"
   cleanup
 
+actionProcessor ::
+     (MonadReader Environment m, MonadState State m, MonadIO m) => m ()
+actionProcessor =
+  updateTexture >>
+  whileM
+    (view channel >>= liftIO . readChan >>= \action ->
+       getAll <$> execWriterT (onAction action))
+
 onAction ::
-     ( MonadReader ( SDL.Renderer
-                   , IO (Maybe (Pic.Image Pixel, Double))
-                   , Double
-                   , Chan Action) m
+     ( MonadReader Environment m
      , MonadIO m
      , MonadState State m
      , MonadWriter All m
@@ -114,22 +124,21 @@ onAction ::
   -> m ()
 onAction Stop = use texture >>= SDL.destroyTexture >> tell (All False)
 onAction (Resize windowDimensions) =
-  view _1 >>= \renderer ->
-    use texture >>= SDL.destroyTexture >> use frame >>=
-    allocate renderer windowDimensions >>=
-    put >>
-    updateTexture renderer >>
-    SDL.present renderer
+  use texture >>= SDL.destroyTexture >> use frame >>= allocate windowDimensions >>=
+  put >>
+  updateTexture >>
+  view renderer >>=
+  SDL.present
 onAction Next =
-  view _2 >>= liftIO >>= \case
+  view reader >>= liftIO >>= \case
     Nothing -> return ()
     Just (frame', time) ->
-      frame .= frame' >> view _1 >>= updateTexture >> SDL.time >>= \currentTime ->
-        view _3 >>= \startTime ->
-          view _4 >>=
-          after (startTime + time - currentTime) . liftIO . (`writeChan` Render)
+      frame .= frame' >> updateTexture >> SDL.time >>= \currentTime ->
+        view startTime >>= \st ->
+          view channel >>=
+          after (st + time - currentTime) . liftIO . (`writeChan` Render)
 onAction Render =
-  view _1 >>= SDL.present >> view _4 >>= liftIO . (`writeChan` Next)
+  view renderer >>= SDL.present >> view channel >>= liftIO . (`writeChan` Next)
 
 -- | Run a command after the specified number of seconds
 after :: MonadIO m => Double -> IO () -> m ()

@@ -20,6 +20,7 @@ data Command
   | PrevImage
   | Multi Int
   | Quit
+  | Open
   deriving (Show)
 
 data Post
