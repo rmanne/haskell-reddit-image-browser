@@ -9,3 +9,4 @@ data Action
   = Quit
   | Resize (V2 CInt)
   | Update String (Maybe FilePath)
+  | ProcessEvents

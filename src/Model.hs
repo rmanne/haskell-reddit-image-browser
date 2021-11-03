@@ -303,7 +303,7 @@ basicUserActionHandler Open =
     void
       (liftIO
          (spawnCommand
-            ("xdg-open https://reddit.com/" <> unpostID (postIdOf post))))
+            ("open https://reddit.com/" <> unpostID (postIdOf post))))
   where
     unpostID (R.PostID p) = Text.unpack p
 basicUserActionHandler _ = throwError ()

@@ -1,9 +1,0 @@
-[submodule "api-builder"]
-	path = api-builder
-	url = https://github.com/intolerable/api-builder.git
-[submodule "reddit"]
-	path = reddit
-	url = https://github.com/rmanne/reddit.git
-[submodule "aria2c-rpc"]
-	path = aria2c-rpc
-	url = https://github.com/rmanne/haskell-aria2c-rpc

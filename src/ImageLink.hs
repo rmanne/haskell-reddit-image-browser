@@ -11,9 +11,9 @@ import qualified Data.Aeson as Aeson
 import Data.Aeson (FromJSON(parseJSON), Object, Value(Array, Object), (.:))
 import Data.Aeson.Types (typeMismatch)
 import Data.Char (isSpace)
-import qualified Data.HashMap.Strict as HashMap
+import qualified Data.Aeson.KeyMap as HashMap
 import Data.List (dropWhileEnd, isSuffixOf)
-import qualified Data.Text as Text
+import qualified Data.Aeson.Key as Key
 import qualified Data.Vector as Vector
 import Network.HTTP.Client
   ( HttpException(HttpExceptionRequest)
@@ -53,13 +53,13 @@ instance FromJSON RedditGallery where
                    case itemType of
                      "image/jpg" ->
                        return
-                         ["https://i.redd.it/" ++ Text.unpack mediaId ++ ".jpg"]
+                         ["https://i.redd.it/" ++ Key.toString mediaId ++ ".jpg"]
                      "image/png" ->
                        return
-                         ["https://i.redd.it/" ++ Text.unpack mediaId ++ ".png"]
+                         ["https://i.redd.it/" ++ Key.toString mediaId ++ ".png"]
                      "image/gif" ->
                        return
-                         ["https://i.redd.it/" ++ Text.unpack mediaId ++ ".gif"]
+                         ["https://i.redd.it/" ++ Key.toString mediaId ++ ".gif"]
                      _ -> return [])
               (HashMap.toList mediaMetadata) >>= \urls ->
               return (RedditGallery (concat urls))

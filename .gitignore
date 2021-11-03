@@ -1,5 +1,5 @@
 .stack-work/
-hs-reddit-image-browser.cabal
-*~
 stack.yaml.lock
-dist-newstyle/
+.direnv/
+result
+dist-newstyle

@@ -1,0 +1,21 @@
+packages: *.cabal
+allow-newer: all
+
+source-repository-package
+  type: git
+  location: https://github.com/intolerable/api-builder.git
+  tag: f7440211195da98cfa93b6a97e51892b939919e1
+  --sha256: 0x890cr9wlc7w4g679imm90bd07z03s07g6nhjsy97r1mq76igzh
+
+source-repository-package
+  type: git
+  location: https://github.com/rmanne/reddit.git
+  tag: 86550fb76ad90f23a434e2fa04e5de7f546ea4e4
+  --sha256: 0lmacgfwy2bnissyv1j49jvfa8dwsgm3r4gibarzk5ya0cy1fvlp
+  -- 26b3937f57416eb2189ed818125da2cd82eccd6a / sha256: 0yr86833z3n7fh7fw54dxc5ba6dvbkv8my0sam99rx4pvz8ymydj
+
+source-repository-package
+  type: git
+  location: https://github.com/rmanne/haskell-aria2c-rpc.git
+  tag: b2794027672b9df2a83def16ca0108de67e2a45c
+  --sha256: 15h6zgab0vrp49iqbc5n4npwm2chgv9qq1bmi7x43as8cixrmdqm

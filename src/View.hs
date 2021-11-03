@@ -1,14 +1,16 @@
 {-# LANGUAGE TemplateHaskell #-}
 
 module View
-  ( view
-  ) where
+  ( view,
+  )
+where
 
 import qualified Codec.FFmpeg as FFmpeg
-import Control.Concurrent (MVar, forkOn, newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (MVar, forkIO, forkOn, isCurrentThreadBound, myThreadId, newEmptyMVar, putMVar, runInBoundThread, takeMVar, threadCapability, threadDelay)
 import Control.Concurrent.Chan (Chan, newChan, readChan, writeChan)
-import Control.Lens ((.=), (??), makeLenses, use, uses)
-import Control.Monad.Extra (whenJustM, whileM)
+import Control.Exception (finally)
+import Control.Lens (makeLenses, use, uses, (.=), (??))
+import Control.Monad.Extra (forever, whenJustM, whileM, (>=>))
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.State.Strict (MonadState, evalStateT)
 import qualified Data.Text as Text
@@ -18,8 +20,7 @@ import qualified SDL
 import Types (Command)
 import View.Render (newThread)
 import qualified View.Render
-import View.Types (Action(Quit, Resize, Update))
-import Control.Exception (finally)
+import View.Types (Action (ProcessEvents, Quit, Resize, Update))
 
 -- TODO: Audio
 -- https://hackage.haskell.org/package/sdl2-2.5.3.0/docs/SDL-Audio.html
@@ -29,13 +30,12 @@ import Control.Exception (finally)
 -- https://github.com/acowley/ffmpeg-light/compare/audio#diff-cbdc928a28fd3b49d906aab9cdb228bc31f3d3017fcbb6b411082f6a3feb6fa7
 -- TODO: Render text
 -- https://hackage.haskell.org/package/sdl2-ttf-2.1.1/docs/SDL-Font.html
-data State =
-  State
-    { _window :: SDL.Window
-    , _renderer :: SDL.Renderer
-    , _windowDimensions :: SDL.V2 CInt
-    , _renderChannel :: Maybe (Chan View.Render.Action, MVar ())
-    }
+data State = State
+  { _window :: SDL.Window,
+    _renderer :: SDL.Renderer,
+    _windowDimensions :: SDL.V2 CInt,
+    _renderChannel :: Maybe (Chan View.Render.Action, MVar ())
+  }
 
 $(makeLenses ''State)
 
@@ -56,24 +56,16 @@ view controllerChannel viewChannel = do
   SDL.clear r
   let viewResources =
         State
-          { _window = w
-          , _renderer = r
-          , _windowDimensions = SDL.V2 100 100
-          , _renderChannel = Nothing
+          { _window = w,
+            _renderer = r,
+            _windowDimensions = SDL.V2 100 100,
+            _renderChannel = Nothing
           }
-  _ <- forkOn 0 (eventLoop controllerChannel viewChannel)
-  _ <- evalStateT (viewLoop viewChannel) viewResources
+  _ <- forkIO $ forever $ writeChan viewChannel ProcessEvents >> threadDelay 5000
+  _ <- evalStateT (viewLoop viewChannel controllerChannel) viewResources
   SDL.destroyRenderer r
   SDL.destroyWindow w
   SDL.quit
-
-eventLoop :: Chan Command -> Chan Action -> IO ()
-eventLoop modelChannel viewChannel =
-  whileM $
-  SDL.waitEvent >>= EventHandler.processEvent modelChannel >>= \case
-    Just Quit -> False <$ writeChan viewChannel Quit
-    Just action -> True <$ writeChan viewChannel action
-    Nothing -> return True
 
 switchFile :: (MonadState State m, MonadIO m) => Maybe FilePath -> m ()
 switchFile Nothing = use renderer >>= sequence_ . ([SDL.clear, SDL.present] ??)
@@ -84,29 +76,39 @@ switchFile (Just file) = do
   renderChannel .= Just (channel, handle)
   dimensions <- use windowDimensions
   _ <-
-    liftIO (forkOn 0 (newThread r file dimensions channel `finally` putMVar handle ()))
+    liftIO (runInBoundThread $ forkIO (newThread r file dimensions channel `finally` putMVar handle ()))
   return ()
 
 endRenderingThread :: (MonadState State m, MonadIO m) => m ()
 endRenderingThread =
   whenJustM (use renderChannel) $ \(channel, mvar) ->
-    liftIO (writeChan channel View.Render.Stop) >> liftIO (takeMVar mvar) >>
-    renderChannel .= Nothing
+    liftIO (writeChan channel View.Render.Stop) >> liftIO (takeMVar mvar)
+      >> renderChannel .= Nothing
 
-viewLoop :: (MonadState State m, MonadIO m) => Chan Action -> m ()
-viewLoop actionChannel =
+viewLoop :: (MonadState State m, MonadIO m) => Chan Action -> Chan Command -> m ()
+viewLoop actionChannel modelChannel =
   whileM $
-  liftIO (readChan actionChannel) >>= \case
-    Quit -> False <$ endRenderingThread
-    Resize dimensions ->
-      windowDimensions .= dimensions >>
-      whenJustM
-        (use renderChannel)
-        (\(channel, _) ->
-           liftIO (writeChan channel (View.Render.Resize dimensions))) >>
-      return True
-    Update title file -> do
-      endRenderingThread
-      uses window SDL.windowTitle >>= (SDL.$= Text.pack title)
-      switchFile file
-      return True
+    liftIO (readChan actionChannel) >>= \case
+      Quit -> False <$ endRenderingThread
+      Resize dimensions ->
+        windowDimensions .= dimensions
+          >> whenJustM
+            (use renderChannel)
+            ( \(channel, _) ->
+                liftIO (writeChan channel (View.Render.Resize dimensions))
+            )
+          >> return True
+      Update title file ->
+        True <$ do
+          endRenderingThread
+          uses window SDL.windowTitle >>= (SDL.$= Text.pack title)
+          switchFile file
+      ProcessEvents ->
+        True
+          <$ SDL.mapEvents
+            ( liftIO . EventHandler.processEvent modelChannel
+                >=> ( \case
+                        Just action -> liftIO (writeChan actionChannel action)
+                        Nothing -> return ()
+                    )
+            )
