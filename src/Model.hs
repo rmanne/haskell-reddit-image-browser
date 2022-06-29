@@ -168,20 +168,21 @@ slideshowWorker :: Chan Command -> IO ()
 slideshowWorker channel =
   threadDelay 3000000 >> writeChan channel Next >> slideshowWorker channel
 
-viewToTitleFile :: (Post, Int) -> (String, Maybe FilePath)
-viewToTitleFile (Deleted (R.PostID post), _) =
+viewToTitleFile :: (Post, Int, Int) -> (String, Maybe FilePath)
+viewToTitleFile (Deleted (R.PostID post), _, postIndex) =
   ("[Deleted] " <> show post, Nothing)
-viewToTitleFile (Failed (R.PostID post), _) =
+viewToTitleFile (Failed (R.PostID post), _, postIndex) =
   ("[Failed] " <> show post, Nothing)
-viewToTitleFile (Submitted post, _) =
+viewToTitleFile (Submitted post, _, postIndex) =
   ( "[Downloading] " <>
     (let (_, month, day) = toGregorian $ utctDay (R.created post)
       in show month <> "/" <> show day) <>
     " [score=" <> show (R.score post) <> "] " <> Text.unpack (R.title post)
   , Nothing)
-viewToTitleFile (Downloaded post files, index) =
+viewToTitleFile (Downloaded post files, index, postIndex) =
   let index' = index `mod` length files
-   in ( (let (_, month, day) = toGregorian $ utctDay (R.created post)
+   in ( "[#" <> show postIndex <> "]" <>
+        (let (_, month, day) = toGregorian $ utctDay (R.created post)
           in show month <> "/" <> show day) <>
         " [score=" <>
         show (R.score post) <>
@@ -198,7 +199,7 @@ viewToTitleFile (Downloaded post files, index) =
 display :: (MonadState Model m, MonadIO m) => m ()
 display =
   use viewChannel >>= \channel ->
-    (,) <$> uses posts (^. current) <*> use currentIndex >>=
+    (,,) <$> uses posts (^. current) <*> use currentIndex <*> uses posts (length . (^. back)) >>=
     liftIO .
     (\(title, file) -> writeChan channel (View.Update title file)) .
     viewToTitleFile

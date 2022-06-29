@@ -6,7 +6,7 @@ module View
 where
 
 import qualified Codec.FFmpeg as FFmpeg
-import Control.Concurrent (MVar, forkIO, forkOn, isCurrentThreadBound, myThreadId, newEmptyMVar, putMVar, runInBoundThread, takeMVar, threadCapability, threadDelay)
+import Control.Concurrent (MVar, forkIO, newEmptyMVar, putMVar, runInBoundThread, takeMVar, threadDelay)
 import Control.Concurrent.Chan (Chan, newChan, readChan, writeChan)
 import Control.Exception (finally)
 import Control.Lens (makeLenses, use, uses, (.=), (??))
