@@ -269,6 +269,6 @@ redditPreviewHandler link =
 xvideosHandler :: DirectLinkHandler
 xvideosHandler link =
   -- https://github.com/ytdl-org/youtube-dl/issues/30271
-  case link =~ ("^https://www.xvideos.com/([a-zA-Z0-9]*)/.*$" :: String) :: [[String]] of
+  case link =~ ("^https?://www.xvideos.com/([a-zA-Z0-9]*)/.*$" :: String) :: [[String]] of
     [[_, _]] -> return [link]
     _ -> return []

@@ -101,7 +101,7 @@ downloadPost
               case snd dl' of
                 YoutubeDL ->
                   readCreateProcessWithExitCode
-                    (shell $ "youtube-dl -w -o '" <> fname <> "' --newline '" <> fst dl' <> "'")
+                    (shell $ "yt-dlp -w -o '" <> fname <> "' --newline '" <> fst dl' <> "'")
                     ""
                     >>= ( \(exitCode, stdout, stderr) ->
                             putStrLn (show dl' <> " failed with code: " <> show exitCode)
