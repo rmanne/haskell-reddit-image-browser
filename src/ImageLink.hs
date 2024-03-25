@@ -91,6 +91,7 @@ type DirectLinkHandler = String -> IO [String]
 handlers :: [Handler]
 handlers =
   [ fmap (map (,DirectLink)) . redditPreviewHandler,
+    fmap (map (,YoutubeDL)) . redgifImageHandler, -- sometimes with a .jpg suffix
     fmap (map (,DirectLink)) . imageHandler,
     fmap (map (,DirectLink)) . baseImageHandler,
     fmap (map (,DirectLink)) . gifvHandler,
@@ -245,13 +246,20 @@ gfycatHandler link =
   case link
          =~ ("^https?://(www.|)gfycat.com(/..|/gifs/detail)?/([a-zA-Z]*)(-.*)?/?(\\?.*)?$" :: String) ::
          [[String]] of
-    [[_, _, _, gfycatId, _, _]] -> return ["https://www.gfycat.com/" <> gfycatId]
+    --[[_, _, _, gfycatId, _, _]] -> return ["https://www.gfycat.com/" <> gfycatId]
+    [[_, _, _, gfycatId, _, _]] -> return ["https://www.redgifs.com/watch/" <> gfycatId]
+    _ -> return []
+
+redgifImageHandler :: DirectLinkHandler
+redgifImageHandler link =
+  case link =~ ("^https?://i.redgifs.com/i/([a-zA-Z0-9]*)(#rel=.*|\\?.*|.jpg)$" :: String) :: [[String]] of
+    [[_, gfycatId, _]] -> return ["https://www.redgifs.com/watch/" <> gfycatId]
     _ -> return []
 
 redgifHandler :: DirectLinkHandler
 redgifHandler link =
-  case link =~ ("^https?://(www.|)redgifs.com/(watch|ifr)/([a-zA-Z]*)$" :: String) :: [[String]] of
-    [[_, _, _, gfycatId]] -> return ["https://www.redgifs.com/watch/" <> gfycatId]
+  case link =~ ("^https?://(www.|v3.|)redgifs.com/(watch|ifr)/([a-zA-Z0-9]*)(#rel=.*|\\?.*|)$" :: String) :: [[String]] of
+    [[_, _, _, gfycatId, _]] -> return ["https://www.redgifs.com/watch/" <> gfycatId]
     _ -> return []
 
 redditVideoHandler :: DirectLinkHandler
