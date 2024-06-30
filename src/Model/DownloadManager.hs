@@ -13,7 +13,7 @@ import Model.Types (Config (aria2Secret, path))
 import qualified Network.Aria2 as Aria2
 import qualified Reddit as R
 import qualified Reddit.Types.Post as R
-import System.Directory (createDirectoryIfMissing, doesFileExist, renameFile)
+import System.Directory (createDirectoryIfMissing, doesFileExist, copyFile, removeFile)
 import System.FilePath.Posix (takeExtension)
 import System.Process (readCreateProcess, readCreateProcessWithExitCode, shell)
 import Types (Command (Download))
@@ -38,7 +38,8 @@ initialize config modelChannel = do
                 Left msg ->
                   print msg >> writeChan modelChannel (Download pid index count [])
                 Right f' ->
-                  renameFile (Text.unpack f') fname
+                  copyFile (Text.unpack f') fname
+		    >> removeFile (Text.unpack f')
                     >> writeChan modelChannel (Download pid index count [fname])
           )
   downloadChannel <- newChan
