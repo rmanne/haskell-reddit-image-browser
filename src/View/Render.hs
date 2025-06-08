@@ -21,6 +21,7 @@ import Data.Monoid (All (All), getAll)
 import Data.Vector.Storable.ByteString (vectorToByteString)
 import Foreign.C.Types (CInt)
 import qualified SDL
+import Control.Concurrent.MVar(takeMVar, MVar, putMVar, newEmptyMVar)
 
 data Action
   = Stop
@@ -28,12 +29,18 @@ data Action
   | Next
   | Render
 
+data EndState
+  = Restart (SDL.V2 CInt)
+  | Exit
+
 type Pixel = Pic.PixelRGB8
 
 data State = State
   { _rectangle :: SDL.Rectangle CInt,
     _texture :: SDL.Texture,
-    _frame :: Pic.Image Pixel
+    _frame :: Pic.Image Pixel,
+    _frameCount :: Int,
+    _windowDimensions :: SDL.V2 CInt
   }
 
 $(makeLenses ''State)
@@ -42,6 +49,7 @@ data Environment = Environment
   { _renderer :: SDL.Renderer,
     _channel :: Chan Action,
     _reader :: IO (Maybe (Pic.Image Pixel, Double)),
+    _endState :: MVar EndState,
     _startTime :: Double
   }
 
@@ -91,10 +99,13 @@ allocate windowDimensions f =
         SDL.TextureAccessStreaming
         (imageDimensionsFor f)
       <*> pure f
+      <*> pure 0
+      <*> pure windowDimensions
 
 newThread :: SDL.Renderer -> FilePath -> SDL.V2 CInt -> Chan Action -> IO ()
 newThread renderer' file originalWindowDimensions channel' = do
   (reader', cleanup) <- FFmpeg.imageReaderTime (FFmpeg.File file)
+  endState' <- newEmptyMVar
   writeChan channel' Render
   reader' >>= \case
     Just (firstFrame, _) ->
@@ -103,9 +114,12 @@ newThread renderer' file originalWindowDimensions channel' = do
           ( allocate originalWindowDimensions firstFrame
               >>= evalStateT actionProcessor
           )
-          . Environment renderer' channel' reader'
+          . Environment renderer' channel' reader' endState'
     Nothing -> cleanup >> fail "Could not find first frame"
   cleanup
+  takeMVar endState' >>= \case
+    Restart latestDimensions -> newThread renderer' file latestDimensions channel'
+    Exit -> return ()
 
 actionProcessor ::
   (MonadReader Environment m, MonadState State m, MonadIO m) => m ()
@@ -124,17 +138,27 @@ onAction ::
   ) =>
   Action ->
   m ()
-onAction Stop = use texture >>= SDL.destroyTexture >> tell (All False)
+onAction Stop =
+  view renderer >>= SDL.clear
+    >> use texture >>= SDL.destroyTexture
+    >> view endState >>= \es -> liftIO (putMVar es Exit)
+    >> tell (All False)
 onAction (Resize windowDimensions) =
-  use texture >>= SDL.destroyTexture >> use frame >>= allocate windowDimensions
-    >>= put
+  use texture >>= SDL.destroyTexture >>
+    use frame >>= allocate windowDimensions >>= put
     >> updateTexture
-    >> view renderer
-    >>= SDL.present
+    >> view renderer >>= SDL.present
 onAction Next =
   view reader >>= liftIO >>= \case
-    Nothing -> return ()
+    Nothing -> use frameCount >>= \fc ->
+      if fc <= 1
+        then return ()
+        else
+          use windowDimensions >>= \wd ->
+            view endState >>= \es -> liftIO (putMVar es (Restart wd))
+              >> tell (All False)
     Just (frame', time) ->
+      (use frameCount >>= (frameCount .=) . (+1)) >>
       frame .= frame' >> updateTexture >> SDL.time >>= \currentTime ->
         view startTime >>= \st ->
           view channel

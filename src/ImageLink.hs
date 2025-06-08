@@ -258,7 +258,7 @@ redgifImageHandler link =
 
 redgifHandler :: DirectLinkHandler
 redgifHandler link =
-  case link =~ ("^https?://(www.|v3.|)redgifs.com/(watch|ifr)/([a-zA-Z0-9]*)(#rel=.*|\\?.*|)$" :: String) :: [[String]] of
+  case link =~ ("^https?://(www.|v3.|)redgifs.com/(watch|ifr)/([a-zA-Z0-9]*)(#.*|\\?.*|)$" :: String) :: [[String]] of
     [[_, _, _, gfycatId, _]] -> return ["https://www.redgifs.com/watch/" <> gfycatId]
     _ -> return []
 

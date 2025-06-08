@@ -54,11 +54,12 @@ view controllerChannel viewChannel = do
   r <- SDL.createRenderer w (-1) SDL.defaultRenderer
   SDL.rendererDrawColor r SDL.$= SDL.V4 0 0 0 255
   SDL.clear r
+  wd <- SDL.get (SDL.windowSize w)
   let viewResources =
         State
           { _window = w,
             _renderer = r,
-            _windowDimensions = SDL.V2 100 100,
+            _windowDimensions = wd,
             _renderChannel = Nothing
           }
   _ <- forkIO $ forever $ writeChan viewChannel ProcessEvents >> threadDelay 5000

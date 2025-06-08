@@ -15,7 +15,7 @@ import qualified Reddit as R
 import qualified Reddit.Types.Post as R
 import System.Directory (createDirectoryIfMissing, doesFileExist, copyFile, removeFile)
 import System.FilePath.Posix (takeExtension)
-import System.Process (readCreateProcess, readCreateProcessWithExitCode, shell)
+import System.Process (readCreateProcessWithExitCode, shell)
 import Types (Command (Download))
 
 initialize :: Config -> Chan Command -> IO (Chan R.Post)
@@ -39,7 +39,7 @@ initialize config modelChannel = do
                   print msg >> writeChan modelChannel (Download pid index count [])
                 Right f' ->
                   copyFile (Text.unpack f') fname
-		    >> removeFile (Text.unpack f')
+                    >> removeFile (Text.unpack f')
                     >> writeChan modelChannel (Download pid index count [fname])
           )
   downloadChannel <- newChan
